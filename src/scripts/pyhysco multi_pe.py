@@ -39,7 +39,6 @@ def main():
     data = DataObject(args.file_1, args.file_2, args.ped, device=device, dtype=dtype)
     loss_func = EPIMRIDistortionCorrection(data, alpha=args.alpha, beta=args.beta, averaging_operator=args.averaging, derivative_operator=args.derivative, regularizer=args.regularizer, rho=args.rho, PC=args.PC)
     B0 = loss_func.initialize(blur_result=True)
-
     # set-up the optimizer
     # change path to be where you want logfile and corrected images to be stored
     opt = args.optimizer(loss_func, max_iter=args.max_iter, verbose=True, path=args.output_dir)

@@ -7,6 +7,8 @@ from torch import cuda
 import numpy as np
 from scipy.io import loadmat
 import nibabel as nib
+import os
+import json
 
 
 def load_data(im1, im2=None, phase_encoding_direction=1, n=None, device='cpu', dtype=torch.float64):
@@ -211,6 +213,167 @@ def load_data(im1, im2=None, phase_encoding_direction=1, n=None, device='cpu', d
 	return rho0, rho1, omega, m, h, permute_back
 
 
+def get_phase_encoding_direction(json_path):
+	"""
+	Parse phase encoding direction from JSON file.
+	
+	Parameters
+	----------
+	json_path : str
+		Path to the JSON file containing phase encoding direction.
+		
+	Returns
+	-------
+	int
+		Phase encoding direction (1 for first dimension, 2 for second, etc.)
+	"""
+	try:
+		with open(json_path, 'r') as f:
+			data = json.load(f)
+			
+		if 'PhaseEncodingDirection' not in data:
+			return 1  # Default to first dimension if not specified
+			
+		pe_dir = data['PhaseEncodingDirection']
+		
+		# Map standard direction notation to dimension index
+		# i/-i -> 1 (first dimension)
+		# j/-j -> 2 (second dimension)
+		# k/-k -> 3 (third dimension)
+		if pe_dir in ['i', '-i']:
+			return 1
+		elif pe_dir in ['j', '-j']:
+			return 2
+		elif pe_dir in ['k', '-k']:
+			return 3
+		else:
+			return 1  # Default to first dimension if unknown
+	except (FileNotFoundError, json.JSONDecodeError, KeyError):
+		return 1  # Default to first dimension if file not found or invalid
+	
+
+class PePair:
+	def __init__(self, pe_image, rpe_image):
+		self.pe_image = pe_image
+		self.rpe_image = rpe_image
+
+
+def load_data_multi_pe_rpe(images, n=None, device='cpu', dtype=torch.float64):
+	"""
+	Load original pair of images and return along with relevant parameters.
+
+	Image dimension ordering in returned images:
+		- Phase encoding direction is in the last dimension.
+		- Frequency encoding direction is in the first dimension (2D) or second dimension (3D)
+			or third dimension (4D).
+		- Slice selection direction is in the first dimension (3D) or second dimension (4D).
+		- Diffusion is in the first dimension (4D).
+
+	Parameters
+	----------
+	images : list of str
+		List of file paths of the input images
+	n : int, optional
+		Number of diffusion directions to load if 4D input (default is None)
+	device : str, optional
+		Device on which to compute operations (default is 'cpu').
+	dtype : torch.dtype, optional
+		Data type for all data tensors (default is torch.float64).
+
+	Returns
+	----------
+	images : torch.Tensor (shape m)
+		Stacked images as a tensor.
+	omega : torch.Tensor (size # of dimensions x 2)
+		Image domain.
+	m : torch.Tensor (size # of dimensions)
+		Discretization size.
+	h : torch.Tensor (size # of dimensions)
+		Cell size.
+	permute_back : list (size # of dimensions)
+		Order to permute dimensions to return the image to input orientation.
+	rel_mats : list of numpy.ndarray
+		List of relative transformation matrices for each image.
+	"""
+
+	rhos = []
+	mats = []
+	for image in images:
+		img = nib.load(image)
+		mat = img.affine
+		mats.append(mat)
+		rho = np.asarray(img.dataobj)
+		rhos.append(rho)
+
+	rel_mats = [np.eye(4)]
+	for image_index in range(1, len(images)):
+		rel_mats.append(np.linalg.inv(mats[0]) @ mats[image_index])
+
+	# Get shape from first image
+	m = torch.tensor(rhos[0].shape, dtype=torch.int, device=device)
+	dim = torch.numel(m)
+
+	# Get phase encoding direction from JSON file
+	# Use the JSON file with the same base name as the first image
+	base_name = os.path.splitext(images[0])[0]
+	json_path = base_name + '.json'
+	phase_encoding_direction = get_phase_encoding_direction(json_path)
+
+	if dim == 2:
+		if phase_encoding_direction == 1:
+			permute = [1, 0]
+			permute_back = [1, 0]
+		else:
+			permute = [0, 1]
+			permute_back = [0, 1]
+		omega_p = torch.zeros(4, dtype=dtype, device=device)
+		Vmat = torch.sqrt(torch.sum(torch.tensor(mats[0], dtype=dtype, device=device)[0:2, 0:2] ** 2, dim=0))
+		omega_p[1::2] = Vmat * m
+		omega = torch.zeros_like(omega_p)
+		for i in range(len(permute)):
+			omega[2 * i:2 * i + 2] = omega_p[2 * permute[i]:2 * permute[i] + 2]
+		m = m[permute]
+		h = (omega[1::2] - omega[:omega.shape[0] - 1:2]) / m
+	elif dim == 3:
+		if phase_encoding_direction == 1:
+			permute = [2, 1, 0]
+			permute_back = [2, 1, 0]
+		else:
+			permute = [2, 0, 1]
+			permute_back = [1, 2, 0]
+		omega_p = torch.zeros(6, dtype=dtype, device=device)
+		Vmat = torch.sqrt(torch.sum(torch.tensor(mats[0], dtype=dtype, device=device)[0:3, 0:3] ** 2, dim=0))
+		omega_p[1::2] = Vmat * m
+		omega = torch.zeros_like(omega_p)
+		for i in range(len(permute)):
+			omega[2 * i:2 * i + 2] = omega_p[2 * permute[i]:2 * permute[i] + 2]
+		m = m[permute]
+		h = (omega[1::2] - omega[:omega.shape[0] - 1:2]) / m
+	else:  # dim=4
+		if phase_encoding_direction == 1:
+			permute = [3, 2, 1, 0]
+			permute_back = [3, 2, 1, 0]
+		else:
+			permute = [3, 2, 0, 1]
+			permute_back = [2, 3, 1, 0]
+		omega = torch.zeros(6, device=device, dtype=dtype)
+		Vmat = torch.sqrt(torch.sum(torch.tensor(mats[0], dtype=dtype, device=device)[0:3, 0:3] ** 2, dim=0))
+		omega[1::2] = (Vmat * m[:-1])[permute[1:]]
+		m = m[permute]
+		if n is not None:
+			m[0] = n
+			for i in range(len(rhos)):
+				rhos[i] = rhos[i][:, :, :, 0:n]
+		omega = torch.hstack((torch.tensor([0, m[0]], dtype=dtype, device=device), omega))
+		h = (omega[1::2] - omega[:omega.shape[0] - 1:2]) / m
+
+	# Stack images and apply permutation
+	rhos = torch.stack([torch.tensor(rho, dtype=dtype, device=device) for rho in rhos], dim=0)
+	rhos = rhos.permute([0] + [i+1 for i in permute])  # Add 1 to permute indices since we added a new dimension
+
+	return rhos, omega, m, h, permute_back, rel_mats
+
+
 def save_data(data, filepath):
 	"""
 	Save data to the given filepath.
@@ -252,6 +415,32 @@ def normalize(im1, im2):
 	i1 = (256 / max_i) * i1
 	i2 = (256 / max_i) * i2
 	return i1, i2
+
+def normalize_multi_pe(images):
+	"""
+	Normalize a stack of images to have the same mean intensity.
+
+	Parameters
+	----------
+	images : torch.Tensor
+		Stack of images to normalize, with first dimension being the image index.
+
+	Returns
+	-------
+	torch.Tensor
+		Normalized stack of images.
+	"""
+	# Calculate mean intensity for each image
+	means = torch.mean(images, dim=tuple(range(1, images.dim())))
+	
+	# Calculate the mean of all image means
+	mean_mean = torch.mean(means)
+	
+	# Normalize each image by scaling its mean to match the overall mean
+	scale_factors = mean_mean / means
+	scale_factors = scale_factors.view(-1, *([1] * (images.dim() - 1)))
+	
+	return images * scale_factors
 
 
 def m_plus(m):
@@ -376,3 +565,68 @@ def get_cell_centered_grid(omega, m, device='cpu', dtype=torch.float64, return_a
 			x1, x2, x3, x4 = torch.meshgrid(xi(1), xi(2), xi(3), xi(4), indexing='ij')
 			x = torch.cat((torch.reshape(x1, (-1, 1)), torch.reshape(x2, (-1, 1)), torch.reshape(x3, (-1, 1)), torch.reshape(x4, (-1, 1))))
 	return x
+
+
+def get_pe_rpe_images(image_path_1, image_path_2):
+	"""
+	Determine which image is PE and which is RPE based on their phase encoding directions.
+	
+	Parameters
+	----------
+	image_path_1 : str
+		Path to first image
+	image_path_2 : str
+		Path to second image
+		
+	Returns
+	-------
+	image_path_pe : str
+		Path to the PE image (positive phase encoding direction)
+	image_path_rpe : str
+		Path to the RPE image (negative phase encoding direction)
+	phase_encoding_direction : int
+		Phase encoding direction (1, 2, or 3)
+	"""
+	# Get phase encoding directions from JSON files
+	# Handle .nii.gz extension by removing both .nii and .gz
+	base_name_1 = os.path.splitext(os.path.splitext(image_path_1)[0])[0]
+	base_name_2 = os.path.splitext(os.path.splitext(image_path_2)[0])[0]
+	json_path_1 = base_name_1 + '.json'
+	json_path_2 = base_name_2 + '.json'
+	
+	# Get phase encoding direction from JSON files
+	with open(json_path_1, 'r') as f:
+		json_data_1 = json.load(f)
+	with open(json_path_2, 'r') as f:
+		json_data_2 = json.load(f)
+	
+	pe_dir_1 = json_data_1['PhaseEncodingDirection']
+	pe_dir_2 = json_data_2['PhaseEncodingDirection']
+	
+	# Get the axis and sign from the phase encoding direction string
+	pe_axis_1 = pe_dir_1[-1]  # Last character is the axis (i, j, k)
+	pe_axis_2 = pe_dir_2[-1]
+	pe_sign_1 = -1 if pe_dir_1.startswith('-') else 1
+	pe_sign_2 = -1 if pe_dir_2.startswith('-') else 1
+	
+	# Convert axis to number (i=1, j=2, k=3)
+	axis_map = {'i': 1, 'j': 2, 'k': 3}
+	pe_axis_1 = axis_map[pe_axis_1]
+	pe_axis_2 = axis_map[pe_axis_2]
+	
+	# Determine which is PE and which is RPE
+	if pe_axis_1 == pe_axis_2:  # Same axis
+		if pe_sign_1 == 1 and pe_sign_2 == -1:
+			image_path_pe = image_path_1
+			image_path_rpe = image_path_2
+			phase_encoding_direction = pe_axis_1
+		elif pe_sign_1 == -1 and pe_sign_2 == 1:
+			image_path_pe = image_path_2
+			image_path_rpe = image_path_1
+			phase_encoding_direction = pe_axis_1
+		else:
+			raise ValueError(f"Invalid phase encoding signs: {pe_dir_1}, {pe_dir_2}. Expected one to be positive and the other negative.")
+	else:
+		raise ValueError(f"Different phase encoding directions: {pe_dir_1}, {pe_dir_2}. Expected same direction.")
+	
+	return image_path_pe, image_path_rpe, phase_encoding_direction

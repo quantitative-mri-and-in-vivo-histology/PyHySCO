@@ -33,7 +33,7 @@ class LeastSquaresCorrection:
         self.dataObj = data
         self.A = A
         self.device = data.device
-        self.xc = get_cell_centered_grid(self.dataObj.omega, self.dataObj.m, device=self.device)
+        self.xc = get_cell_centered_grid(self.dataObj.omega, self.dataObj.m, device=self.device, dtype=self.dataObj.dtype)
 
     def apply_correction(self, yc):
         """

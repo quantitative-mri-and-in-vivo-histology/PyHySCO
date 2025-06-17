@@ -198,6 +198,8 @@ class EPIOptimize:
 
         save_data(self.Bc.reshape(list(m_plus(self.corr_obj.dataObj.m))).permute(self.corr_obj.dataObj.p),
                   self.path + '-EstFieldMap.nii.gz')
+        save_data(self.B0.reshape(list(m_plus(self.corr_obj.dataObj.m))).permute(self.corr_obj.dataObj.p),
+                  self.path + '-InitFieldMap.nii.gz')
 
         if method == 'jac':
             corr1 = self.corr_obj.corr1.reshape(list(self.corr_obj.dataObj.m)).permute(self.corr_obj.dataObj.p)
