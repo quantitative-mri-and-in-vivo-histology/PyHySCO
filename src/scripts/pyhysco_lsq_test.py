@@ -75,6 +75,8 @@ class MultiPeDataObject:
         pe_rpe_permute = []
 
         image_config['pe_pairs'] = [image_config['pe_pairs'][0]]
+
+        # image_config['pe_pairs'] = image_config['pe_pairs'][0:2]
         
         for image_pair_index, image_path_pair in enumerate(image_config['pe_pairs']):
 
