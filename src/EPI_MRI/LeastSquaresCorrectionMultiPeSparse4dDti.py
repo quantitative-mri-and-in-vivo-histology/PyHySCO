@@ -1,8 +1,13 @@
 import math
+
+import torch
+
 from EPI_MRI.utils import *
+import torchsparsegradutils as tsgu
+from optimization.LinearSolvers import *
 
 
-class LeastSquaresCorrectionMultiPe:
+class LeastSquaresCorrectionMultiPeSparse4dDti:
     """
     Given a field map, produces a corrected image using multiple PE-RPE pairs.
 
@@ -56,10 +61,24 @@ class LeastSquaresCorrectionMultiPe:
         alpha = 1e-3
 
         # --- NEW: Get full coordinate grid (all dims) ---
-        xc = get_cell_centered_grid(self.dataObj.omega, self.dataObj.m,
+        xc = get_cell_centered_grid(self.dataObj.omega[2:], self.dataObj.m[1:],
                                     device=self.device,
                                     dtype=self.dataObj.dtype,
                                     return_all=True)
+
+        bvec = self.dataObj.bvec  # shape: (3, N)
+        bvec = bvec.T  # now shape: (N, 3) like MATLAB's bvecDti
+
+        Q = -1 * torch.stack([
+            bvec[:, 0] ** 2,
+            bvec[:, 1] ** 2,
+            bvec[:, 2] ** 2,
+            2 * bvec[:, 0] * bvec[:, 1],
+            2 * bvec[:, 0] * bvec[:, 2],
+            2 * bvec[:, 1] * bvec[:, 2],
+        ], dim=1)
+
+        B = sparse_kron_mat_int(Q, self.dataObj.m[-2] * self.dataObj.m[-1])
 
         # Process each PE-RPE pair
         for i, pair in enumerate(self.dataObj.image_pairs):
@@ -73,26 +92,26 @@ class LeastSquaresCorrectionMultiPe:
 
             P = \
             torch.eye(3, device=self.dataObj.device, dtype=self.dataObj.dtype)[
-                self.dataObj.permute[i]]
+                self.dataObj.permute[i][1:]]
             T = torch.tensor(self.dataObj.rel_mats[i][:3, :3],
                              device=self.dataObj.device,
                              dtype=self.dataObj.dtype)
             T_permuted = P @ T @ P.T
-
             v_rot = T_permuted @ v
+            # v_rot = torch.round(v_rot)
 
             center = 0.5 * (
-                        torch.tensor(self.dataObj.omega[1::2]) + torch.tensor(
-                    self.dataObj.omega[::2]))  # (x_c, y_c, z_c)
+                        torch.tensor(self.dataObj.omega[3::2]) + torch.tensor(
+                    self.dataObj.omega[2::2]))  # (x_c, y_c, z_c)
 
             xp1 = T_permuted @ (xp1 - center.unsqueeze(1)) + center.view(3, 1)
             xp2 = T_permuted @ (xp2 - center.unsqueeze(1)) + center.view(3, 1)
 
-            xp1 = xp1[1:, :].reshape(2, *self.dataObj.m)
-            xp2 = xp2[1:, :].reshape(2, *self.dataObj.m)
+            xp1 = xp1[1:, :].reshape(2, *self.dataObj.m[1:])
+            xp2 = xp2[1:, :].reshape(2, *self.dataObj.m[1:])
 
-            xp1 = xp1.reshape(2, *self.dataObj.m)
-            xp2 = xp2.reshape(2, *self.dataObj.m)
+            xp1 = xp1.reshape(2, *self.dataObj.m[1:])
+            xp2 = xp2.reshape(2, *self.dataObj.m[1:])
 
             x0, x1, y0, y1 = self.dataObj.omega[-4:]
 
@@ -112,13 +131,10 @@ class LeastSquaresCorrectionMultiPe:
             # Flatten it to 1D
             valid_mask_flat = valid_mask.flatten()  # shape (H*W,)
 
-
-
-
-
             C1_slices = []
             C2_slices = []
-            for slice_index in range(self.dataObj.m[0]):
+            for slice_index in range(self.dataObj.m[1]):
+
                 C1_slice = self.get_push_forward_matrix_2d_analytic(
                     self.dataObj.omega[-4:],
                     self.dataObj.m[-2:],
@@ -128,7 +144,7 @@ class LeastSquaresCorrectionMultiPe:
                 )
 
                 # Apply to C1_slice, C2_slice and corresponding rho rows
-                C1_slice = C1_slice[valid_mask_flat, :]
+                # C1_slice = C1_slice[valid_mask_flat, :]
                 C1_slices.append(C1_slice)
 
                 C2_slice = self.get_push_forward_matrix_2d_analytic(
@@ -138,7 +154,7 @@ class LeastSquaresCorrectionMultiPe:
                     self.dataObj.h[-2:],
                     self.dataObj.h[-2:]
                 )
-                C2_slice = C2_slice[valid_mask_flat, :]
+                # C2_slice = C2_slice[valid_mask_flat, :]
                 C2_slices.append(C2_slice)
 
             C1 = torch.stack(C1_slices, dim=0)
@@ -149,28 +165,103 @@ class LeastSquaresCorrectionMultiPe:
             # Store matrices and data
             C_list.append(C)
 
-
-
             rho0 = pair.pe_image
             rho1 = pair.rpe_image
 
-            rho0 = rho0.reshape(self.dataObj.m[0], -1)
-            rho1 = rho1.reshape(self.dataObj.m[0], -1)
+            rho0 = rho0.reshape(self.dataObj.m[0], self.dataObj.m[1], -1)
+            rho1 = rho1.reshape(self.dataObj.m[0], self.dataObj.m[1], -1)
 
-            rho0_masked = rho0[:, valid_mask_flat]
-            rho1_masked = rho1[:, valid_mask_flat]
-
-            rho_list.append(torch.hstack((rho0_masked, rho1_masked)))
+            rho_list.append(torch.cat((rho0, rho1), dim=-1))
 
         # Concatenate all matrices and data
         C_all = torch.cat(C_list, dim=1)
-        rho_all = torch.cat(rho_list, dim=1)
+        rho_all = torch.cat(rho_list, dim=-1)
+
+        rhocorr_slices = []
+        # for slice_index in range(self.dataObj.m[1]):
+        for slice_index in range(2):
+
+            print(slice_index)
+            rhocorr_vols = []
+            A = C_all[slice_index]
+
+            rho_slices_per_vol = []
+            for vol_index in range(self.dataObj.m[0]):
+                b = torch.log(rho_all[vol_index, slice_index])
+                rho_slices_per_vol.append(b)
+
+            # A, row_idx = self.drop_pushforward_matrix_rows(A, 1e-3)
 
 
-        rhocorr = torch.linalg.lstsq(C_all, rho_all.unsqueeze(2)).solution
 
-        full_rhocorr = rhocorr.reshape(*self.dataObj.m)
+            # rho_per_vol = torch.stack(rho_slices_per_vol, dim=0)
+            # rho_per_vol = rho_per_vol[:,row_idx]
+            # rho_per_vol = rho_per_vol.view(-1)
 
+            # Step 1: Stack and flatten data BEFORE filtering
+            rho_per_vol = torch.stack(rho_slices_per_vol, dim=0)
+            rho_per_vol_flat = rho_per_vol.view(rho_per_vol.shape[0], -1)
+
+            # Step 2: Compute mask BEFORE filtering A
+            valid_rho_mask = torch.isfinite(rho_per_vol_flat).all(
+                dim=0)  # shape: (N_vox,)
+
+            # Step 3: Drop rows from A where either mass is too low or rho is invalid
+            A, row_mask = self.drop_pushforward_matrix_rows_with_mask(A, 1e-3,
+                                                                      extra_mask=valid_rho_mask)
+
+            # Step 4: Apply same row_mask to rho_per_vol
+            rho_per_vol_filtered = rho_per_vol_flat[:, row_mask]
+            rho_per_vol_filtered = rho_per_vol_filtered.reshape(-1)
+
+            K = sparse_kron_eye_mat(A, bvec.shape[
+                0])  # shape: (N_dir*N_vox, N_dir*N_par)
+            C = torch.sparse.mm(K, B)
+
+            b_reg = rho_per_vol_filtered.view(-1).unsqueeze(1)
+
+            # b_normals = []
+            # for k in range(b_reg.shape[1]):
+            #     b_k = b_reg[:, k].unsqueeze(1).contiguous()
+            #     b_k = b_k.to(C.device)  # match C's device
+            #     b_k_normal = torch.sparse.mm(C.transpose(0, 1), b_k).squeeze(1)
+            #     b_normals.append(b_k_normal)
+            # b_normal = torch.stack(b_normals, dim=0)  # shape [K, 16_384]
+            # t = 1
+            #
+            # def A_func(x):
+            #     return torch.sparse.mm(C.transpose(0, 1),
+            #                            torch.sparse.mm(C, x.unsqueeze(
+            #                                1))).squeeze(1)
+            #
+            # with torch.no_grad():
+            #     diag = torch.sparse.mm(
+            #         C.transpose(0, 1),
+            #         torch.sparse.mm(C, torch.ones((C.shape[1], 1),
+            #                                           device=C.device))
+            #     ).squeeze(1)
+            #
+            # def M_inv(r):
+            #     return r / (
+            #             diag + 1e-6)  # Add epsilon for numerical stability
+            #
+            # pcg = BlockPCG()
+            # rhocorr = pcg.eval(A_func, b_normal)
+            # rhocorr = rhocorr[0]
+
+
+
+
+            rhocorr = tsgu.sparse_lstsq.sparse_generic_lstsq(C, rho_per_vol_filtered.view(-1))
+
+
+
+
+            rhocorr_slices.append(rhocorr)
+
+        rhocorr = torch.cat(rhocorr_slices, dim=0)
+        # full_rhocorr = rhocorr.reshape(*self.dataObj.m[1:])
+        full_rhocorr = rhocorr.reshape(6, 2, self.dataObj.m[2], self.dataObj.m[3])
         return full_rhocorr
 
 
@@ -262,8 +353,14 @@ class LeastSquaresCorrectionMultiPe:
         J = J[valid]
         B = B[valid]
 
-        T = torch.zeros(H * W, N, dtype=Bx.dtype, device=Px.device)
-        T[I, J] = B
+        n_rows = N
+        n_cols = N
+        indices = torch.stack([I, J], dim=0)  # shape (2, K)
+        values = B  # shape (K,)
+
+        T = torch.sparse_coo_tensor(indices, values,
+                                           size=(n_rows, n_cols),
+                                           device=self.device, dtype=B.dtype)
 
         return T
 
@@ -441,3 +538,96 @@ class LeastSquaresCorrectionMultiPe:
         Bij[ind2] = x[ind2] - 1 / (2 * eps / h) * x[ind2] ** 2 + eps / (h * 2)
         Bij[ind3] = eps / h
         return Bij / eps
+
+
+    def drop_pushforward_matrix_rows(self, T, thres):
+        C = T.coalesce()
+
+        # 2. Compute row sums
+        row_sums = torch.zeros(C.size(0), device=C.device, dtype=C.dtype)
+        row_sums.index_add_(0, C.indices()[0], C.values())
+
+        # 3. Identify valid rows
+        valid_rows = row_sums >= thres
+        valid_row_indices = torch.nonzero(valid_rows).squeeze(1)
+
+        # 4. Build mapping from old row indices to new ones
+        old_to_new = -torch.ones(C.size(0), device=C.device, dtype=torch.long)
+        old_to_new[valid_row_indices] = torch.arange(len(valid_row_indices),
+                                                     device=C.device)
+
+        # 5. Select only entries in valid rows
+        keep_mask = valid_rows[C.indices()[0]]
+        new_indices_raw = C.indices()[:, keep_mask]
+        new_values = C.values()[keep_mask]
+
+        # 6. Remap old row indices to new indices
+        new_rows = old_to_new[new_indices_raw[0]]
+        new_cols = new_indices_raw[1]
+        new_indices = torch.stack([new_rows, new_cols], dim=0)
+
+        # 7. Create reduced-size sparse matrix
+        filtered_C = torch.sparse_coo_tensor(
+            new_indices,
+            new_values,
+            size=(len(valid_row_indices), C.size(1)),
+            # new row count, original column count
+            dtype=C.dtype,
+            device=C.device
+        )
+
+        return filtered_C, valid_rows
+
+
+    def drop_pushforward_matrix_rows_with_mask(self, T, thres, extra_mask=None):
+        """
+        Drops rows from a sparse matrix `T` with row sums below `thres`
+        and optionally those indicated by `extra_mask` (e.g., NaN in target).
+
+        Parameters
+        ----------
+        T : torch.sparse_coo_tensor
+            Sparse matrix (row-major).
+        thres : float
+            Threshold for row sum to be considered valid.
+        extra_mask : torch.BoolTensor or None
+            Optional mask of shape (T.shape[0],) indicating additional rows to drop.
+
+        Returns
+        -------
+        filtered_T : torch.sparse_coo_tensor
+            Filtered sparse matrix with invalid rows removed.
+        valid_rows : torch.BoolTensor
+            Boolean mask of retained rows (same size as original row count).
+        """
+        C = T.coalesce()
+        row_sums = torch.zeros(C.size(0), device=C.device, dtype=C.dtype)
+        row_sums.index_add_(0, C.indices()[0], C.values())
+
+        valid_rows = row_sums >= thres
+
+        if extra_mask is not None:
+            valid_rows &= extra_mask  # Drop also where external mask is False
+
+        valid_row_indices = torch.nonzero(valid_rows).squeeze(1)
+        old_to_new = -torch.ones(C.size(0), device=C.device, dtype=torch.long)
+        old_to_new[valid_row_indices] = torch.arange(len(valid_row_indices),
+                                                     device=C.device)
+
+        keep_mask = valid_rows[C.indices()[0]]
+        new_indices_raw = C.indices()[:, keep_mask]
+        new_values = C.values()[keep_mask]
+
+        new_rows = old_to_new[new_indices_raw[0]]
+        new_cols = new_indices_raw[1]
+        new_indices = torch.stack([new_rows, new_cols], dim=0)
+
+        filtered_C = torch.sparse_coo_tensor(
+            new_indices,
+            new_values,
+            size=(len(valid_row_indices), C.size(1)),
+            dtype=C.dtype,
+            device=C.device
+        )
+
+        return filtered_C.coalesce(), valid_rows

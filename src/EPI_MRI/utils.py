@@ -374,7 +374,7 @@ def load_data_multi_pe_rpe(images, n=None, device='cpu', dtype=torch.float64):
 	return rhos, omega, m, h, permute_back, rel_mats
 
 
-def save_data(data, filepath):
+def save_data(data, filepath, affine=None):
 	"""
 	Save data to the given filepath.
 
@@ -385,8 +385,10 @@ def save_data(data, filepath):
 	filepath : str
 		Path where to save data.
 	"""
+	if affine is None:
+		affine = np.eye(4)
 	if filepath is not None:
-		save_img = nib.Nifti1Image(np.asarray(data.cpu()), np.eye(4))
+		save_img = nib.Nifti1Image(np.asarray(data.cpu()), affine)
 		nib.save(save_img, filepath)
 
 
@@ -630,3 +632,193 @@ def get_pe_rpe_images(image_path_1, image_path_2):
 		raise ValueError(f"Different phase encoding directions: {pe_dir_1}, {pe_dir_2}. Expected same direction.")
 	
 	return image_path_pe, image_path_rpe, phase_encoding_direction
+
+
+def sparse_kron_mat_int(Q, N_p):
+    """
+    Computes the sparse Kronecker product of Q and identity matrix of size N_p.
+
+    Q: Tensor of shape (N_dir, 6)
+    Returns sparse matrix of shape (N_dir*N_p, 6*N_p)
+    """
+    device = Q.device
+    dtype = Q.dtype
+
+    N_dir, D = Q.shape
+    total_rows = N_dir * N_p
+    total_cols = D * N_p
+
+    # Build row and col indices
+    q_row = torch.arange(N_dir, device=device).repeat_interleave(D)
+    q_col = torch.arange(D, device=device).repeat(N_dir)
+    q_val = Q.flatten()
+
+    # Repeat each row block for each voxel
+    row_idx = (q_row[:, None] * N_p + torch.arange(N_p, device=device)).reshape(-1)
+    col_idx = (q_col[:, None] * N_p + torch.arange(N_p, device=device)).reshape(-1)
+    val = q_val.repeat_interleave(N_p)
+
+    indices = torch.stack([row_idx, col_idx], dim=0)
+    B = torch.sparse_coo_tensor(indices, val, size=(total_rows, total_cols), device=device, dtype=dtype)
+    return B.coalesce()
+
+
+# Let:
+# A: (N_vox, N_par) (sparse)
+# Q: (N_dir, 6)
+# B: (N_dir*N_vox, 6*N_par) from sparse_kron_mat_int(Q, N_vox)
+
+def sparse_kron_eye_mat(A, N_dir):
+    """
+    Builds a sparse Kronecker product of I (size N_dir) with sparse matrix A.
+    Result is block diagonal with A repeated N_dir times.
+    Output shape: (N_dir * A.shape[0], N_dir * A.shape[1])
+    """
+    A = A.coalesce()
+    row_A, col_A = A.indices()
+    val_A = A.values()
+
+    n_rows, n_cols = A.shape
+    total_rows = N_dir * n_rows
+    total_cols = N_dir * n_cols
+
+    row_idx = []
+    col_idx = []
+    val = []
+
+    for i in range(N_dir):
+        row_shift = i * n_rows
+        col_shift = i * n_cols
+        row_idx.append(row_A + row_shift)
+        col_idx.append(col_A + col_shift)
+        val.append(val_A)
+
+    row_idx = torch.cat(row_idx)
+    col_idx = torch.cat(col_idx)
+    val = torch.cat(val)
+
+    indices = torch.stack([row_idx, col_idx], dim=0)
+    return torch.sparse_coo_tensor(indices, val, size=(total_rows, total_cols), device=A.device, dtype=A.dtype).coalesce()
+
+def permute_affine_axes(affine, perm):
+    """
+    Permute the axes of an affine matrix according to the given permutation.
+
+    Parameters
+    ----------
+    affine : np.ndarray
+        4x4 affine matrix (e.g. from a NIfTI image)
+    perm : list or array of length 3
+        Permutation of axes, e.g., [0, 2, 1] means:
+        - original x becomes x
+        - original y becomes z
+        - original z becomes y
+
+    Returns
+    -------
+    permuted_affine : np.ndarray
+        The 4x4 affine matrix with permuted axes.
+    """
+    permuted_affine = torch.eye(4, dtype=affine.dtype, device=affine.device)
+
+    # Rotation + scaling part
+    R = affine[:3, :3]
+    permuted_affine[:3, :3] = R[perm, :][:, perm]
+
+    # Translation part
+    t = affine[:3, 3]
+    permuted_affine[:3, 3] = t[perm]
+
+    return permuted_affine
+
+def rescale_affine(A_src, scale):
+    """
+    Rescale affine to reflect resampling from m_source to m_target in 3D.
+
+    Parameters
+    ----------
+    A_src : (4, 4) np.ndarray
+        Original affine matrix of the source image.
+    m_source : tuple of int
+        Shape (D, H, W) or (Z, Y, X) of the source image.
+    m_target : tuple of int
+        Shape of the target image.
+
+    Returns
+    -------
+    A_tgt : (4, 4) np.ndarray
+        New affine matrix for the target image.
+    """
+    A_tgt = A_src.clone()
+    A_tgt[:3, :3] = A_src[:3, :3] @ torch.diag(scale)
+    return A_tgt
+
+
+def compute_fa_from_tensor(D):
+    """
+    Compute fractional anisotropy (FA) from a tensor field stored as [H, W, 6].
+
+    Parameters
+    ----------
+    D : torch.Tensor
+        Tensor of shape [H, W, 6] containing diffusion tensor components:
+        [Dxx, Dyy, Dzz, Dxy, Dxz, Dyz] per voxel.
+
+    Returns
+    -------
+    FA : torch.Tensor
+        Fractional anisotropy map of shape [H, W].
+    """
+    Dxx, Dyy, Dzz, Dxy, Dxz, Dyz = [D[..., i] for i in range(6)]
+
+    # Reconstruct full tensor [H, W, 3, 3]
+    tensor = torch.stack([
+        torch.stack([Dxx, Dxy, Dxz], dim=-1),
+        torch.stack([Dxy, Dyy, Dyz], dim=-1),
+        torch.stack([Dxz, Dyz, Dzz], dim=-1)
+    ], dim=-2)  # shape [H, W, 3, 3]
+
+    eigvals = torch.linalg.eigvalsh(tensor)  # shape [H, W, 3]
+    md = eigvals.mean(dim=-1)
+
+    sqrt_3_over_2 = torch.sqrt(torch.tensor(1.5, device=D.device, dtype=D.dtype))
+    numerator = sqrt_3_over_2 * torch.linalg.norm(eigvals - md.unsqueeze(-1), dim=-1)
+    denominator = torch.linalg.norm(eigvals, dim=-1)
+
+    fa = numerator / (denominator + 1e-12)  # Avoid division by zero
+
+    return fa
+
+def sparse_kron(A, B):
+    """
+    Compute the sparse Kronecker product of two sparse matrices A ⊗ B.
+
+    Parameters
+    ----------
+    A : torch.sparse_coo_tensor of shape [m, n]
+    B : torch.sparse_coo_tensor of shape [p, q]
+
+    Returns
+    -------
+    torch.sparse_coo_tensor of shape [m*p, n*q]
+    """
+    A = A.coalesce()
+    B = B.coalesce()
+
+    rows_A, cols_A = A.indices()
+    rows_B, cols_B = B.indices()
+
+    vals_A = A.values()
+    vals_B = B.values()
+
+    # Kronecker indices
+    row_idx = (rows_A[:, None] * B.shape[0] + rows_B[None, :]).reshape(-1)
+    col_idx = (cols_A[:, None] * B.shape[1] + cols_B[None, :]).reshape(-1)
+
+    # Kronecker values (outer product of A and B values)
+    val_idx = (vals_A[:, None] * vals_B[None, :]).reshape(-1)
+
+    indices = torch.stack([row_idx, col_idx], dim=0)
+    shape = (A.shape[0] * B.shape[0], A.shape[1] * B.shape[1])
+
+    return torch.sparse_coo_tensor(indices, val_idx, shape, device=A.device, dtype=A.dtype)

@@ -108,6 +108,7 @@ class EPIMRIDistortionCorrection:
 			self.PC = PC(self.dataObj)
 		else:
 			self.PC = None
+		# self.PC = None
 
 	def eval(self, yc, yref=None, do_derivative=False, calc_hessian=False):
 		"""
@@ -188,6 +189,16 @@ class EPIMRIDistortionCorrection:
 		if not do_derivative:
 			return Jc
 		dJ = dD + hd*self.alpha*dS + hd*self.beta*dP + self.rho*dQ
+
+
+		save_data(dD.permute(1, 2, 0),
+				  f"/home/laurin/workspace/PyHySCO/data/results/debug/dD_org.nii.gz")
+		save_data(dS.permute(1, 2, 0),
+				  f"/home/laurin/workspace/PyHySCO/data/results/debug/dS_org.nii.gz")
+		save_data(dP.permute(1, 2, 0),
+				  f"/home/laurin/workspace/PyHySCO/data/results/debug/dP_org.nii.gz")
+
+
 		if not calc_hessian:
 			return Jc, dJ
 		else:

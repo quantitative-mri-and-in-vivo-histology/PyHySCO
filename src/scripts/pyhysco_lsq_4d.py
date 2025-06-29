@@ -1,13 +1,17 @@
+from EPI_MRI.LeastSquaresCorrectionMultiPeSparse4dMasked import \
+    LeastSquaresCorrectionMultiPeSparse4dMasked
 from optimization.ADMM import *
 from EPI_MRI.EPIMRIDistortionCorrection import *
 from EPI_MRI.LeastSquaresCorrectionMultiPe import *
+from EPI_MRI.LeastSquaresCorrectionMultiPeSparse import *
+from EPI_MRI.LeastSquaresCorrectionMultiPeSparse4d import *
 import argparse
 import warnings
 import torch.nn.functional as F
 
 
 class MultiPeDataObject:
-    def __init__(self, image_config, device='cpu', dtype=torch.float64):
+    def __init__(self, image_config, device='cpu', dtype=torch.float64, pair_idx=None, first_vol_only=False):
         self.image_config = image_config
         self.image_pairs = []
         self.omega = []
@@ -18,6 +22,8 @@ class MultiPeDataObject:
         self.rel_mats = []
         self.device = device
         self.dtype = dtype
+        self.pair_idx = pair_idx
+        self.first_vol_only = first_vol_only
         self.image_pairs, self.omega, self.m, self.h, self.permute, self.permute_back, self.rel_mats = self.load_data()
 
     def load_data(self):
@@ -74,9 +80,18 @@ class MultiPeDataObject:
         pe_rpe_permute_back = []
         pe_rpe_permute = []
 
-        image_config['pe_pairs'] = [image_config['pe_pairs'][0]]
+        n = None
 
+        # image_config['pe_pairs'] = [image_config['pe_pairs'][0]]
         # image_config['pe_pairs'] = image_config['pe_pairs'][0:2]
+
+        if self.pair_idx is None:
+            pass
+        elif isinstance(self.pair_idx, list):
+            image_pairs = [image_config['pe_pairs'][self.pair_idx] for self.pair_idx in self.pair_idx]
+            image_config['pe_pairs'] = image_pairs
+        else:
+            image_config['pe_pairs'] = [image_config['pe_pairs'][self.pair_idx]]
         
         for image_pair_index, image_path_pair in enumerate(image_config['pe_pairs']):
 
@@ -96,6 +111,10 @@ class MultiPeDataObject:
             n2_img = nib.load(image_path_2)
             rho0 = np.asarray(n1_img.dataobj)
             rho1 = np.asarray(n2_img.dataobj)
+
+            if self.first_vol_only and rho1.ndim == 4:
+                rho0 = rho0[:, :, :, 1]
+                rho1 = rho1[:, :, :, 1]
 
             mat = n1_img.affine
             pe_rpe_mats.append(mat)
@@ -199,7 +218,7 @@ def main():
     parser.add_argument("--PC", default=JacobiCG, help="Preconditioner to use (default=JacobiCG)")
 
     device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
-    device = 'cpu'
+    # device = 'cpu'
     # print(device)
 
     args = parser.parse_args()
@@ -212,7 +231,11 @@ def main():
         warnings.warn("Recommended use is a one-dimensional (in the distortion dimension) regularizer for ADMM.")
     else:
         args.rho = 0.0
-    data = MultiPeDataObject(args.image_config, device=device, dtype=dtype)
+
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    pair_idx = [0,1,2,3]
+    data = MultiPeDataObject(args.image_config, device=device, dtype=dtype, pair_idx=pair_idx, first_vol_only=True)
 
 
     # loss_func = EPIMRIDistortionCorrection(data, alpha=args.alpha, beta=args.beta, averaging_operator=args.averaging, derivative_operator=args.derivative, regularizer=args.regularizer, rho=args.rho, PC=args.PC)
@@ -233,8 +256,15 @@ def main():
     save_data(B0_detached.reshape(list(m_plus(data.m))).permute(data.permute_back[0]),
                 os.path.join(args.output_dir, 'EstFieldMap.nii.gz'))
 
+
+    rel_mat = data.rel_mats[1]
+
+    pair_idx = [0, 1, 2, 3]
+    data = MultiPeDataObject(args.image_config, device=device, dtype=dtype, pair_idx=pair_idx)
+    # data.rel_mats[0] = rel_mat
+
     avg_operator = myAvg1D(data.omega, data.m, dtype=dtype, device=device)
-    opt = LeastSquaresCorrectionMultiPe(data, avg_operator)
+    opt = LeastSquaresCorrectionMultiPeSparse4dMasked(data, avg_operator)
     corrected_image = opt.apply_correction(B0)
     save_data(corrected_image.reshape(list(data.m)).permute(data.permute_back[0]),
                 os.path.join(args.output_dir, 'imCorrected.nii.gz'))

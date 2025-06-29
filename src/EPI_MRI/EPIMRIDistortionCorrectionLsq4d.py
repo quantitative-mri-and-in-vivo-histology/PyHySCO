@@ -5,7 +5,7 @@ from EPI_MRI.Preconditioners import *
 import torchsparsegradutils as tsgu
 
 
-class EPIMRIDistortionCorrectionLsq:
+class EPIMRIDistortionCorrectionLsq4d:
 	"""
 	Implements distortion correction using a least squares approach to find a single corrected image
 	from multiple phase encoding directions.
@@ -81,7 +81,7 @@ class EPIMRIDistortionCorrectionLsq:
 		self.D = derivative_operator(self.dataObj.omega[-4:], self.dataObj.m[-2:], self.dtype, self.device)
 		self.D_vol = derivative_operator(self.dataObj.omega[-2:], self.dataObj.m[-1:], self.dtype, self.device)
 		self.xc = get_cell_centered_grid(self.dataObj.omega, self.dataObj.m, device=self.device, dtype=self.dtype).reshape(tuple(self.dataObj.m))
-		self.S = QuadRegularizer(regularizer(self.dataObj.omega,self.dataObj.m, self.dtype, self.device))
+		self.S = QuadRegularizer(regularizer(self.dataObj.omega[2:],self.dataObj.m[1:], self.dtype, self.device))
 		self.Q = TikRegularizer(self.dataObj.omega, self.dataObj.m)
 		self.alpha = alpha
 		self.beta = beta
@@ -139,7 +139,7 @@ class EPIMRIDistortionCorrectionLsq:
 		sse = 0.0
 
 		# --- NEW: Get full coordinate grid (all dims) ---
-		xc = get_cell_centered_grid(self.dataObj.omega, self.dataObj.m,
+		xc = get_cell_centered_grid(self.dataObj.omega[2:], self.dataObj.m[1:],
 										device=self.device,
 									dtype=self.dataObj.dtype,
 									return_all=True)
@@ -161,7 +161,7 @@ class EPIMRIDistortionCorrectionLsq:
 			P = \
 				torch.eye(3, device=self.dataObj.device,
 						  dtype=self.dataObj.dtype)[
-				self.dataObj.permute[i]]
+				self.dataObj.permute[i][1:]]
 			T = torch.tensor(self.dataObj.rel_mats[i][:3, :3],
 						 device=self.dataObj.device,
 						 dtype=self.dataObj.dtype)
@@ -169,14 +169,14 @@ class EPIMRIDistortionCorrectionLsq:
 
 			v_rot = T_permuted @ v
 			center = 0.5 * (
-					torch.tensor(self.dataObj.omega[1::2]) + torch.tensor(
-				self.dataObj.omega[::2]))  # (x_c, y_c, z_c)
+					torch.tensor(self.dataObj.omega[3::2]) + torch.tensor(
+				self.dataObj.omega[2::2]))  # (x_c, y_c, z_c)
 
 			xp1 = T_permuted @ (xp1 - center.unsqueeze(1)) + center.view(3, 1)
 			xp2 = T_permuted @ (xp2 - center.unsqueeze(1)) + center.view(3, 1)
 
-			xp1 = xp1[1:, :].reshape(2, *self.dataObj.m)
-			xp2 = xp2[1:, :].reshape(2, *self.dataObj.m)
+			xp1 = xp1[1:, :].reshape(2, *self.dataObj.m[1:])
+			xp2 = xp2[1:, :].reshape(2, *self.dataObj.m[1:])
 
 			x0, x1, y0, y1 = self.dataObj.omega[-4:]
 
@@ -198,7 +198,7 @@ class EPIMRIDistortionCorrectionLsq:
 			Jac1_slices = []
 			Jac2_slices = []
 
-			for slice_index in range(self.dataObj.m[0]):
+			for slice_index in range(self.dataObj.m[1]):
 				C1_slice, dC1_slice, Jac1_slice = self.get_push_forward_matrix_2d_analytic(
 					self.dataObj.omega[-4:],
 					self.dataObj.m[-2:],
@@ -243,42 +243,44 @@ class EPIMRIDistortionCorrectionLsq:
 			rho0 = pair.pe_image
 			rho1 = pair.rpe_image
 
-			rho0 = rho0.reshape(self.dataObj.m[0], -1)
-			rho1 = rho1.reshape(self.dataObj.m[0], -1)
+			rho0 = rho0.reshape(self.dataObj.m[0], self.dataObj.m[1], -1)
+			rho1 = rho1.reshape(self.dataObj.m[0], self.dataObj.m[1], -1)
 
-			rho_list.append(torch.hstack((rho0, rho1)))
+			rho_list.append(torch.cat((rho0, rho1), dim=-1))
 
 		# Concatenate all matrices and data
 		C_all = torch.cat(C_list, dim=1)
-		rho_all = torch.cat(rho_list, dim=1)
+		rho_all = torch.cat(rho_list, dim=-1)
 		Jac_all = torch.stack(Jac_list, dim=0)
 
-		slices = []
-		for slice_index in range(self.dataObj.m[0]):
+		rhocorr_vols = []
+		for vol_index in range(self.dataObj.m[0]):
+			rhocorr_slices = []
+			for slice_index in range(self.dataObj.m[1]):
+				A = C_all[slice_index]
+				b = rho_all[vol_index, slice_index].unsqueeze(1)
 
-			A = C_all[slice_index]
-			b = rho_all[slice_index]
+				# A, row_idx = self.drop_pushforward_matrix_rows(A, thres)
+				# b = b[row_idx]
 
-			L = torch.eye(A.shape[1], dtype=A.dtype, device=A.device)
-			L = L.to_sparse_coo()
-			sqrt_lam = torch.sqrt(
-				torch.tensor(0.1, dtype=A.dtype, device=A.device))
-			A_reg = torch.cat([A, sqrt_lam * L], dim=0)
-			b_reg = torch.cat([b.unsqueeze(1),
-							   torch.zeros((L.shape[0], 1), dtype=b.dtype,
-										   device=b.device)], dim=0)
+				L = torch.eye(A.shape[1], dtype=A.dtype, device=A.device)
+				L = L.to_sparse_coo()
+				sqrt_lam = torch.sqrt(
+					torch.tensor(0.05, dtype=A.dtype, device=A.device))
+				A_reg = torch.cat([A, sqrt_lam * L], dim=0)
+				b_reg = torch.cat([b,
+								   torch.zeros((L.shape[0], 1), dtype=b.dtype,
+											   device=b.device)], dim=0)
 
-			rhocorr = tsgu.sparse_lstsq.sparse_generic_lstsq(A_reg, b_reg)
-			slices.append(rhocorr)
-			sse += (((C_all[slice_index] @ rhocorr) - rho_all[slice_index])**2).sum()
+				rhocorr = tsgu.sparse_lstsq.sparse_generic_lstsq(A_reg, b_reg)
+				rhocorr_slices.append(rhocorr)
+			rhocorr_vol = torch.cat(rhocorr_slices, dim=0)
+			rhocorr_vols.append(rhocorr_vol)
 
-		rhocorr = torch.cat(slices, dim=0)
+		rhocorr = torch.cat(rhocorr_vols, dim=0)
 		rhocorr = rhocorr.reshape(*self.dataObj.m)
-
-
 		self.recon_image = rhocorr
 
-		# dD = torch.zeros_like(yc)
 
 		# Precompute for reuse
 		hd = torch.prod(self.dataObj.h)
@@ -287,85 +289,73 @@ class EPIMRIDistortionCorrectionLsq:
 		# Loop over each image pair and slice
 		dD_per_image = []
 		for i in range(len(self.dataObj.image_pairs)):
-			dD_slices = []
-			for slice_index in range(self.dataObj.m[0]):
-				# Get the relevant dC and Jacobians for this pair/slice
-				dC1_slice, dC2_slice = dC_list[i][slice_index]
 
-				# Get PE/RPE slice from corrected image (computed from LS)
-				rhoc = rhocorr[slice_index].reshape(-1)
+			dD_vols = []
+			for vol_index in range(self.dataObj.m[0]):
+				dD_slices = []
+				for slice_index in range(self.dataObj.m[1]):
+					# Get the relevant dC and Jacobians for this pair/slice
+					dC1_slice, dC2_slice = dC_list[i][slice_index]
 
-				# Compute residuals: predicted - observed
-				res1 = dC1_slice(rhoc)  # shape (H*W, 2)
-				res2 = dC2_slice(rhoc)  # same shape
+					# Get PE/RPE slice from corrected image (computed from LS)
+					rhoc = rhocorr[vol_index,slice_index].reshape(-1)
 
-				# Combine contributions
-				# This assumes 2D dC returns torch.stack([dx, dy], dim=-1)
-				# You must apply chain rule back to 1D field in phase encoding direction
-				dres = res1 - res2  # shape: (H*W, N, 2
-				pe_dim = -1  # assume this is 1
-				dy_contrib = dres[..., pe_dim]  # shape: (H*W, N)
+					# Compute residuals: predicted - observed
+					res1 = dC1_slice(rhoc)  # shape (H*W, 2)
+					res2 = dC2_slice(rhoc)  # same shape
 
-				v = torch.tensor([0.0, 0.0, 1.0], device=self.device,
-								 dtype=self.dataObj.dtype)
+					# Combine contributions
+					# This assumes 2D dC returns torch.stack([dx, dy], dim=-1)
+					# You must apply chain rule back to 1D field in phase encoding direction
+					dres = res1 - res2  # shape: (H*W, N, 2
+					pe_dim = -1  # assume this is 1
+					dy_contrib = dres[..., pe_dim]  # shape: (H*W, N)
 
-				P = \
-					torch.eye(3, device=self.dataObj.device,
-							  dtype=self.dataObj.dtype)[
-						self.dataObj.permute[i]]
-				T = torch.tensor(self.dataObj.rel_mats[i][:3, :3],
-								 device=self.dataObj.device,
-								 dtype=self.dataObj.dtype)
-				T_permuted = P @ T @ P.T
+					v = torch.tensor([0.0, 0.0, 1.0], device=self.device,
+									 dtype=self.dataObj.dtype)
 
-				v_rot = T_permuted @ v
+					P = \
+						torch.eye(3, device=self.dataObj.device,
+								  dtype=self.dataObj.dtype)[
+							self.dataObj.permute[i][1:]]
+					T = torch.tensor(self.dataObj.rel_mats[i][:3, :3],
+									 device=self.dataObj.device,
+									 dtype=self.dataObj.dtype)
+					T_permuted = P @ T @ P.T
 
-				v_inplane = v_rot[
-							1:]  # if you dropped the first (slice) dimension
-				# assuming slice dimension is 0 (z), then keep [x, y]
+					v_rot = T_permuted @ v
 
-				# Normalize
-				v_inplane = v_inplane / torch.norm(v_inplane)
-				dy_contrib = dres[..., 0] * v_inplane[0] + dres[..., 1] * \
-							 v_inplane[1]
+					v_inplane = v_rot[
+								1:]  # if you dropped the first (slice) dimension
+					# assuming slice dimension is 0 (z), then keep [x, y]
 
-				# dy_contrib = dres[..., 0]
+					# Normalize
+					v_inplane = v_inplane / torch.norm(v_inplane)
+					dy_contrib = dres[..., 0] * v_inplane[0] + dres[..., 1] * \
+								 v_inplane[1]
 
-				# dy_contrib = torch.matmul(dres, v_rot)
+					# dy_contrib = dres[..., 0]
 
-				dy_sum = dy_contrib.sum(
-					dim=1)  # sum contributions from all particles
+					# dy_contrib = torch.matmul(dres, v_rot)
 
-				dy_sum = dy_sum.to_dense()
-				dD_slice = self.D.transp_mat_mul(dy_sum.reshape(self.dataObj.m[1], self.dataObj.m[2]))
-				dD_slices.append(dD_slice)
+					dy_sum = dy_contrib.sum(
+						dim=1)  # sum contributions from all particles
 
-			dD_image = torch.cat(dD_slices, dim=0)  # final shape: (m0 * m1 * m2,)
-			dD_per_image.append(dD_image.view(self.dataObj.m[0], self.dataObj.m[1], -1))
+					dy_sum = dy_sum.to_dense()
+					dD_slice = self.D.transp_mat_mul(dy_sum.reshape(self.dataObj.m[2], self.dataObj.m[3]))
+					dD_slices.append(dD_slice)
 
-		dD = torch.stack(dD_per_image, dim=0).mean(dim=0)
+				dD_vol = torch.cat(dD_slices, dim=0)
+				dD_vols.append(dD_vol)
 
-		# Jac_all = [Jac_list[i][slice_idx][0] for i in range(len(Jac_list)) for
-		# 			slice_idx in range(len(Jac_list[i]))]
-		# Jac_stack = torch.stack(Jac_all,
-		# 						 dim=0)  # shape: (n_slices_total, H*W)
-		# Jac_mean = Jac_stack.reshape(
-		# 	*self.dataObj.m)  # shape: (m0, m1, m2)
+			dD_image = torch.cat(dD_vols, dim=0)  # final shape: (m0 * m1 * m2,)
+			dD_per_image.append(dD_image.view(self.dataObj.m[0], self.dataObj.m[1], self.dataObj.m[2], -1))
 
-		Jac_mean = Jac_all.mean(dim=0).reshape(*self.dataObj.m)
+		dD = torch.stack(dD_per_image, dim=0).mean(dim=[0,1])
+
+		Jac_mean = Jac_all.mean(dim=0).reshape(*self.dataObj.m[1:])
 
 		hd = torch.prod(self.dataObj.h)
-
-		# # compute distance measure
-		# Dc, dDc = self.distance(T1c, T2c)
-		# dD = None
-		# if do_derivative:
-		# 	geom = FI1 + FI2
-		# 	intensity = Jac1 * dFI1 + Jac2 * dFI2
-		# 	dD = self.D.transp_mat_mul(dDc*geom) + self.A.transp_mat_mul(dDc*intensity)
-		# else:
-		# 	geom = None
-		# 	intensity = None
 
 		# smoothness regularizer
 		Sc, dS, d2S = self.S.eval(yc, do_derivative=do_derivative)
@@ -378,12 +368,20 @@ class EPIMRIDistortionCorrectionLsq:
 		Jc = Dc + hd * self.alpha * Sc + hd * self.beta * Pc
 		results = [Jc]
 
+		save_data(dD.permute(1, 2, 0),
+				  f"/home/laurin/workspace/PyHySCO/data/results/debug/dD.nii.gz")
+		save_data(dS.permute(1, 2, 0),
+				  f"/home/laurin/workspace/PyHySCO/data/results/debug/dS.nii.gz")
+
 		if do_derivative:
 			dP_slices = []
-			for slice_index in range(self.dataObj.m[0]):
+			for slice_index in range(self.dataObj.m[1]):
 				dP_slice = self.D.transp_mat_mul(dG[slice_index])
 				dP_slices.append(dP_slice)
 			dP = torch.stack(dP_slices, dim=0)
+
+			save_data(dP.permute(1, 2, 0),
+					  f"/home/laurin/workspace/PyHySCO/data/results/debug/dP.nii.gz")
 
 			dJ = dD + hd * self.alpha * dS + hd * self.beta * dP
 			# save terms of objective function and corrected images
@@ -394,31 +392,37 @@ class EPIMRIDistortionCorrectionLsq:
 
 		if calc_hessian:
 			def H(x):
-				d2D_slices = []
 
-				for slice_index in range(self.dataObj.m[0]):
-					x_slice = x[slice_index]  # shape (m1, m2)
-					d2D_slice = torch.zeros_like(x_slice)
+				d2D_vols = []
+				for vol_index in range(self.dataObj.m[0]):
 
-					for i in range(len(self.dataObj.image_pairs)):
-						dC1_slice, dC2_slice = dC_list[i][slice_index]
+					d2D_slices = []
+					for slice_index in range(self.dataObj.m[1]):
+						x_slice = x[slice_index]  # shape (m1, m2)
+						d2D_slice = torch.zeros_like(x_slice)
 
-						# Apply directional derivative to x_slice
-						Dx1 = dC1_slice(x_slice.reshape(-1))  # (H*W, 2)
-						Dx2 = dC2_slice(x_slice.reshape(-1))  # (H*W, 2)
+						for i in range(len(self.dataObj.image_pairs)):
+							dC1_slice, dC2_slice = dC_list[i][slice_index]
 
-						dres = Dx1 - Dx2  # (H*W, 2)
-						dy = dres[
-							..., -1]  # take PE direction component (e.g., dim 1)
-						dy_sum = dy.to_dense().sum(dim=1)  # sum over particles
+							# Apply directional derivative to x_slice
+							Dx1 = dC1_slice(x_slice.reshape(-1))  # (H*W, 2)
+							Dx2 = dC2_slice(x_slice.reshape(-1))  # (H*W, 2)
 
-						# Apply Dᵀ to PE residuals
-						d2D_slice += self.D.transp_mat_mul(
-							dy_sum.reshape(self.dataObj.m[1], self.dataObj.m[2]))
+							dres = Dx1 - Dx2  # (H*W, 2)
+							dy = dres[
+								..., -1]  # take PE direction component (e.g., dim 1)
+							dy_sum = dy.to_dense().sum(dim=1)  # sum over particles
 
-					d2D_slices.append(d2D_slice)
+							# Apply Dᵀ to PE residuals
+							d2D_slice += self.D.transp_mat_mul(
+								dy_sum.reshape(self.dataObj.m[2], self.dataObj.m[3]))
 
-				d2D	= torch.stack(d2D_slices)
+						d2D_slices.append(d2D_slice)
+					d2D_vol	= torch.stack(d2D_slices)
+					d2D_vols.append(d2D_vol)
+
+				d2D = torch.stack(d2D_vols)
+				d2D = d2D.mean(dim=[0])
 				reg_term = self.alpha * self.S.H.mat_mul(x.reshape(-1))
 				d2D = d2D + hd * reg_term
 

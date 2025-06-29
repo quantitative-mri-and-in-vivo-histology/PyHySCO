@@ -193,24 +193,112 @@ class EPIOptimize:
         corr1(, corr2) : torch.Tensor
             corrected image(s)
         """
-        self.Bc = self.Bc.detach()
-        self.B0 = self.B0.detach()
 
-        save_data(self.Bc.reshape(list(m_plus(self.corr_obj.dataObj.m))).permute(self.corr_obj.dataObj.p),
-                  self.path + '-EstFieldMap.nii.gz')
-        save_data(self.B0.reshape(list(m_plus(self.corr_obj.dataObj.m))).permute(self.corr_obj.dataObj.p),
-                  self.path + '-InitFieldMap.nii.gz')
+        # self.Bc = self.Bc.detach()
+        # self.B0 = self.B0.detach()
+        #
+        # save_data(
+        #     self.Bc.reshape(list(m_plus(self.corr_obj.dataObj.m))).permute(
+        #         self.corr_obj.dataObj.p),
+        #     self.path + '-EstFieldMap.nii.gz')
+        # save_data(
+        #     self.B0.reshape(list(m_plus(self.corr_obj.dataObj.m))).permute(
+        #         self.corr_obj.dataObj.p),
+        #     self.path + '-InitFieldMap.nii.gz')
+        #
+        # if method == 'jac':
+        #     corr1 = self.corr_obj.corr1.reshape(
+        #         list(self.corr_obj.dataObj.m)).permute(self.corr_obj.dataObj.p)
+        #     corr2 = self.corr_obj.corr2.reshape(
+        #         list(self.corr_obj.dataObj.m)).permute(self.corr_obj.dataObj.p)
+        #     save_data(corr1, self.path + '-im1Corrected.nii.gz')
+        #     save_data(corr2, self.path + '-im2Corrected.nii.gz')
+        #     return corr1, corr2
+        # elif method == 'lstsq':
+        #     lstsq_corr = LeastSquaresCorrection(self.corr_obj.dataObj,
+        #                                         self.corr_obj.A)
+        #     corr = lstsq_corr.apply_correction(self.Bc).permute(
+        #         self.corr_obj.dataObj.p)
+        #     save_data(corr, self.path + '-imCorrected.nii.gz')
+        #     return corr
 
-        if method == 'jac':
-            corr1 = self.corr_obj.corr1.reshape(list(self.corr_obj.dataObj.m)).permute(self.corr_obj.dataObj.p)
-            corr2 = self.corr_obj.corr2.reshape(list(self.corr_obj.dataObj.m)).permute(self.corr_obj.dataObj.p)
-            save_data(corr1, self.path + '-im1Corrected.nii.gz')
-            save_data(corr2, self.path + '-im2Corrected.nii.gz')
-            return corr1, corr2
-        elif method == 'lstsq':
-            lstsq_corr = LeastSquaresCorrection(self.corr_obj.dataObj, self.corr_obj.A)
-            corr = lstsq_corr.apply_correction(self.Bc).permute(self.corr_obj.dataObj.p)
-            save_data(corr, self.path + '-imCorrected.nii.gz')
-            return corr
-        else:
-            raise NotImplementedError('correction method not supported')
+        # corr1 = self.corr_obj.recon_image.reshape(
+        #     list(self.corr_obj.dataObj.m)).permute(
+        #     self.corr_obj.dataObj.permute[0])
+        # save_data(corr1, self.path + '-imCorrected.nii.gz')
+        #
+        # self.Bc = self.Bc.detach()
+        # self.B0 = self.B0.detach()
+        #
+        # save_data(
+        #     self.Bc.reshape(list(m_plus(self.corr_obj.dataObj.m))).permute(
+        #         self.corr_obj.dataObj.p),
+        #     self.path + '-EstFieldMap.nii.gz')
+        # save_data(
+        #     self.B0.reshape(list(m_plus(self.corr_obj.dataObj.m))).permute(
+        #         self.corr_obj.dataObj.p),
+        #     self.path + '-InitFieldMap.nii.gz')
+
+        try:
+            self.Bc = self.Bc.detach()
+            self.B0 = self.B0.detach()
+
+            if self.corr_obj.dataObj.m.ndim == 3:
+                save_data(self.Bc.reshape(list(m_plus(self.corr_obj.dataObj.m))).permute(self.corr_obj.dataObj.p),
+                          self.path + '-EstFieldMap.nii.gz')
+                save_data(self.B0.reshape(list(m_plus(self.corr_obj.dataObj.m))).permute(self.corr_obj.dataObj.p),
+                          self.path + '-InitFieldMap.nii.gz')
+
+            if method == 'jac':
+                corr1 = self.corr_obj.corr1.reshape(list(self.corr_obj.dataObj.m)).permute(self.corr_obj.dataObj.p)
+                corr2 = self.corr_obj.corr2.reshape(list(self.corr_obj.dataObj.m)).permute(self.corr_obj.dataObj.p)
+                save_data(corr1, self.path + '-im1Corrected.nii.gz')
+                save_data(corr2, self.path + '-im2Corrected.nii.gz')
+                return corr1, corr2
+            elif method == 'lstsq':
+                lstsq_corr = LeastSquaresCorrection(self.corr_obj.dataObj, self.corr_obj.A)
+                corr = lstsq_corr.apply_correction(self.Bc).permute(self.corr_obj.dataObj.p)
+                save_data(corr, self.path + '-imCorrected.nii.gz')
+                return corr
+            else:
+                raise NotImplementedError('correction method not supported')
+        except Exception as e:
+            pass
+
+        try:
+
+            if self.corr_obj.dataObj.m.shape[0] == 4:
+                save_data(
+                    self.Bc.reshape(list(m_plus(self.corr_obj.dataObj.m[1:]))).permute(
+                        self.corr_obj.dataObj.permute[0][1:]),
+                    self.path + '-EstFieldMap.nii.gz')
+                save_data(
+                    self.B0.reshape(list(m_plus(self.corr_obj.dataObj.m[1:]))).permute(
+                        self.corr_obj.dataObj.permute[0][1:]),
+                    self.path + '-InitFieldMap.nii.gz')
+            else:
+                save_data(
+                    self.Bc.reshape(
+                        list(m_plus(self.corr_obj.dataObj.m))).permute(
+                        self.corr_obj.dataObj.permute[0]),
+                    self.path + '-EstFieldMap.nii.gz')
+                save_data(
+                    self.B0.reshape(
+                        list(m_plus(self.corr_obj.dataObj.m))).permute(
+                        self.corr_obj.dataObj.permute[0]),
+                    self.path + '-InitFieldMap.nii.gz')
+
+            if method == 'jac':
+                corr1 = self.corr_obj.recon_image.reshape(
+                    list(self.corr_obj.dataObj.m)).permute(self.corr_obj.dataObj.permute[0])
+                save_data(corr1, self.path + '-imCorrected.nii.gz')
+                return corr1
+            elif method == 'lstsq':
+                corr1 = self.corr_obj.recon_image.reshape(
+                    list(self.corr_obj.dataObj.m)).permute(self.corr_obj.dataObj.permute[0])
+                save_data(corr1, self.path + '-imCorrected.nii.gz')
+                return corr1
+            else:
+                raise NotImplementedError('correction method not supported')
+        except Exception as e:
+            pass

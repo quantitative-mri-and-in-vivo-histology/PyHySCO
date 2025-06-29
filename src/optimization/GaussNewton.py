@@ -1,5 +1,6 @@
 from optimization.EPIOptimize import EPIOptimize
 from optimization.LinearSolvers import *
+from EPI_MRI.utils import *
 import time
 import torch
 
@@ -49,7 +50,7 @@ class GaussNewton(EPIOptimize):
         else:
             self.linear_solver = linear_solver
         if line_search is None:
-            self.line_search = Armijo() 
+            self.line_search = Armijo()
         else:   
             self.line_search = line_search
   
@@ -76,8 +77,9 @@ class GaussNewton(EPIOptimize):
         Jc, dJ, H, M = self.corr_obj.eval(self.B0, yref=yref, do_derivative=True, calc_hessian=True)
 
         Jstop = abs(Jc)
-        tolJ = 1e-3
-        tolY = 1e-2
+        tolJ = 1e-5
+        tolY = 1e-4
+        self.tolG = 1e-6
 
         self.log.log_iteration(
             {'iteration': "Iteration", 'loss': "Loss Value", 'CG iters': "Inner Iters", 'CG rel residual': "Inner Rel Residual", 'LS iters': "LS iters",
@@ -99,7 +101,14 @@ class GaussNewton(EPIOptimize):
             self.Bc = yt
             Jc, dJ, H, M = self.corr_obj.eval(self.Bc, yref=yref, do_derivative=True, calc_hessian=True)
             
-            self.log.log_iteration({'iteration': i, 'loss': Jc.item(), 'CG iters': it, 'CG rel residual': resOpt/resvec[0].item(), 'LS iters': LSiter, 'stepsize': t, 'dist val': self.corr_obj.Dc.item(), 'reg val': self.corr_obj.Sc.item(), 'grad norm': torch.norm(dJ).item()})
+            # self.log.log_iteration({'iteration': i, 'loss': Jc.item(), 'CG iters': it, 'CG rel residual': resOpt/resvec[0].item(), 'LS iters': LSiter, 'stepsize': t, 'dist val': self.corr_obj.Dc.item(), 'reg val': self.corr_obj.Sc.item(), 'grad norm': torch.norm(dJ).item()})
+            self.log.log_iteration(
+                {'iteration': i, 'loss': Jc.item(), 'CG iters': it,
+                 'CG rel residual': resOpt / resvec[0].item(),
+                 'LS iters': LSiter, 'stepsize': t,
+                 'reg val': self.corr_obj.Sc.item(),
+                 'grad norm': torch.norm(dJ).item()})
+
             fevals = fevals + 1 + LSiter
             stop_grad = torch.norm(dJ) <= self.tolG
             stop_func_change = i > 1 and (torch.abs(Jc - self.log.history[-2]['loss'])) <= tolJ * (1 + Jstop)

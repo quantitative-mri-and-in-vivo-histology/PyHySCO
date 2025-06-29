@@ -36,9 +36,13 @@ def main():
         warnings.warn("Recommended use is a one-dimensional (in the distortion dimension) regularizer for ADMM.")
     else:
         args.rho = 0.0
-    data = DataObject(args.file_1, args.file_2, args.ped, device=device, dtype=dtype)
+    data = DataObject(args.file_1, args.file_2, args.ped, device=device, dtype=dtype, do_normalize=True)
     loss_func = EPIMRIDistortionCorrection(data, alpha=args.alpha, beta=args.beta, averaging_operator=args.averaging, derivative_operator=args.derivative, regularizer=args.regularizer, rho=args.rho, PC=args.PC)
     B0 = loss_func.initialize(blur_result=True)
+    B0_detached = B0.detach()
+
+    save_data(B0_detached.reshape(list(m_plus(data.m))).permute(data.p),
+                os.path.join(args.output_dir, 'EstFieldMap.nii.gz'))
 
     # set-up the optimizer
     # change path to be where you want logfile and corrected images to be stored

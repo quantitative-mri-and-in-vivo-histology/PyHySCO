@@ -1,8 +1,9 @@
 import math
 from EPI_MRI.utils import *
+import torchsparsegradutils as tsgu
 
 
-class LeastSquaresCorrectionMultiPe:
+class LeastSquaresCorrectionMultiPeSparse:
     """
     Given a field map, produces a corrected image using multiple PE-RPE pairs.
 
@@ -78,12 +79,30 @@ class LeastSquaresCorrectionMultiPe:
                              device=self.dataObj.device,
                              dtype=self.dataObj.dtype)
             T_permuted = P @ T @ P.T
+            #T_permuted = P.T @ T @ P
+            # T_permuted = torch.tensor([
+            #     [1., 0., 0.],
+            #     [0., 0., -1.],
+            #     [0., 1., 0.]
+            # ], device=self.dataObj.device, dtype=self.dataObj.dtype)
+            #
+            # T_permuted = torch.tensor([
+            #     [ 1.0000,  0.0000,  0.0000],
+            #     [ 0.0000,  0.7071, -0.7071],
+            #     [ 0.0000,  0.7071,  0.7071]
+            # ], device=self.dataObj.device, dtype=self.dataObj.dtype)
 
             v_rot = T_permuted @ v
+            # v_rot = torch.round(v_rot)
 
             center = 0.5 * (
                         torch.tensor(self.dataObj.omega[1::2]) + torch.tensor(
                     self.dataObj.omega[::2]))  # (x_c, y_c, z_c)
+
+            # grid_center_vox = 0.5 * (torch.tensor(self.dataObj.m) - 1)
+            # center = torch.tensor(self.dataObj.omega[::2],
+            #                       device=self.device) + grid_center_vox * torch.tensor(
+            #     self.dataObj.h, device=self.device)
 
             xp1 = T_permuted @ (xp1 - center.unsqueeze(1)) + center.view(3, 1)
             xp2 = T_permuted @ (xp2 - center.unsqueeze(1)) + center.view(3, 1)
@@ -128,7 +147,7 @@ class LeastSquaresCorrectionMultiPe:
                 )
 
                 # Apply to C1_slice, C2_slice and corresponding rho rows
-                C1_slice = C1_slice[valid_mask_flat, :]
+                # C1_slice = C1_slice[valid_mask_flat, :]
                 C1_slices.append(C1_slice)
 
                 C2_slice = self.get_push_forward_matrix_2d_analytic(
@@ -138,7 +157,7 @@ class LeastSquaresCorrectionMultiPe:
                     self.dataObj.h[-2:],
                     self.dataObj.h[-2:]
                 )
-                C2_slice = C2_slice[valid_mask_flat, :]
+                # C2_slice = C2_slice[valid_mask_flat, :]
                 C2_slices.append(C2_slice)
 
             C1 = torch.stack(C1_slices, dim=0)
@@ -157,20 +176,65 @@ class LeastSquaresCorrectionMultiPe:
             rho0 = rho0.reshape(self.dataObj.m[0], -1)
             rho1 = rho1.reshape(self.dataObj.m[0], -1)
 
-            rho0_masked = rho0[:, valid_mask_flat]
-            rho1_masked = rho1[:, valid_mask_flat]
+            # rho0_masked = rho0[:, valid_mask_flat]
+            # rho1_masked = rho1[:, valid_mask_flat]
 
-            rho_list.append(torch.hstack((rho0_masked, rho1_masked)))
+            rho_list.append(torch.hstack((rho0, rho1)))
 
         # Concatenate all matrices and data
         C_all = torch.cat(C_list, dim=1)
         rho_all = torch.cat(rho_list, dim=1)
 
+        # Solve least squares problem
 
-        rhocorr = torch.linalg.lstsq(C_all, rho_all.unsqueeze(2)).solution
+        # --- Build finite difference gradient matrix G ---
+        # H = self.dataObj.m[-1]
+        # W = self.dataObj.m[-2]
+        # N = H*W
+        # x0, x1, y0, y1 = self.dataObj.omega[-4:]
+        # hx = (x1 - x0) / N
+        # hy = (y1 - y0) / N
+        # Dx = (torch.eye(N, device=self.dataObj.device, dtype=self.dataObj.dtype)[:-1]
+        #       - torch.eye(N, device=self.dataObj.device, dtype=self.dataObj.dtype)[1:])
+        # Dx = Dx / hx  # shape: (H-1, H)
+        #
+        # Dy = (torch.eye(N, device=self.dataObj.device, dtype=self.dataObj.dtype)[:-1]
+        #       - torch.eye(N, device=self.dataObj.device, dtype=self.dataObj.dtype)[1:])
+        # Dy = Dy / hy  # shape: (W-1, W)
+        #
+        # Ix = torch.eye(N, device=self.dataObj.device, dtype=self.dataObj.dtype)
+        # Iy = torch.eye(N, device=self.dataObj.device, dtype=self.dataObj.dtype)
+        #
+        # Gx = torch.kron(Ix, Dx)  # shape: ((H-1)*W, H*W)
+        # Gy = torch.kron(Dy, Iy)  # shape: (H*(W-1), H*W)
+        # G = torch.cat([Gx, Gy], dim=0)  # shape: (P, N)
+        #
+        # # --- Stack regularization into the least squares problem ---
+        # A_aug = torch.cat([C_all, (alpha ** 0.5) * G],
+        #                   dim=0)  # shape: (M + P, N)
+        # b_aug = torch.cat(
+        #     [rho_all, torch.zeros(G.shape[0], device=self.dataObj.device, dtype=self.dataObj.dtype)],
+        #     dim=0)  # shape: (M + P,)
 
+
+        # rhocorr = torch.linalg.lstsq(C_all, rho_all.unsqueeze(2)).solution
+        # rhocorr = tsgu.sparse_lstsq.sparse_generic_lstsq(C_all[0], rho_all[0])
+
+        slices = []
+        for slice_index in range(self.dataObj.m[0]):
+            rhocorr = tsgu.sparse_lstsq.sparse_generic_lstsq(C_all[slice_index], rho_all[slice_index])
+            slices.append(rhocorr)
+
+        rhocorr = torch.cat(slices, dim=0)
+
+        # rhocorr = rhocorr.reshape(list(self.dataObj.m))
+
+
+        # full_rhocorr = torch.zeros(np.prod(self.dataObj.m), dtype=rhocorr.dtype,
+        #                            device=rhocorr.device)
+        # full_rhocorr[valid_mask.flatten()] = rhocorr.flatten()
+        # full_rhocorr = rhocorr.reshape(*self.dataObj.m)
         full_rhocorr = rhocorr.reshape(*self.dataObj.m)
-
         return full_rhocorr
 
 
@@ -262,8 +326,14 @@ class LeastSquaresCorrectionMultiPe:
         J = J[valid]
         B = B[valid]
 
-        T = torch.zeros(H * W, N, dtype=Bx.dtype, device=Px.device)
-        T[I, J] = B
+        n_rows = N
+        n_cols = N
+        indices = torch.stack([I, J], dim=0)  # shape (2, K)
+        values = B  # shape (K,)
+
+        T = torch.sparse_coo_tensor(indices, values,
+                                           size=(n_rows, n_cols),
+                                           device=self.device, dtype=B.dtype)
 
         return T
 
