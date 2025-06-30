@@ -434,7 +434,7 @@ def laplacian_2d(H: int, W: int):
 #     # z = z.at[idx].add(val)
 #     return contrib
 
-@jax.jit
+
 def pic_adjoint(y: jnp.ndarray,
                 indices: jnp.ndarray,
                 weights: jnp.ndarray) -> jnp.ndarray:
@@ -443,7 +443,7 @@ def pic_adjoint(y: jnp.ndarray,
     return jnp.sum(contrib, axis=1)      # shape: (N_particles,)
 
 
-@partial(jax.jit, static_argnums=(3))
+
 def pic_forward(rho, indices, weights, n_cells):
     idx = indices.reshape(-1)
     val = (rho[:, None] * weights).reshape(-1)
@@ -451,7 +451,7 @@ def pic_forward(rho, indices, weights, n_cells):
 
 
 
-@partial(jax.jit, static_argnums=(3,4))
+
 def pic_normal_matvec(rho: jnp.ndarray,
                       indices: jnp.ndarray,
                       weights: jnp.ndarray,
@@ -468,6 +468,10 @@ def pic_normal_matvec(rho: jnp.ndarray,
         y = pic_forward(x, idx, w, n_cells)             # (N,)
         yt = pic_adjoint(y, idx, w) # (n_cells,)
         return yt
+
+    # def single_TtT(x, idx, w):
+    #     y = pic_adjoint(x, idx, w)             # (N,)
+    #     return pic_forward(y, idx, w, n_cells) # (n_particles,)
 
     TtT = jnp.zeros_like(rho)
     for k in range(n_obs):
@@ -608,7 +612,7 @@ def solve_lsq_slice(
     M_inv = lambda r: r / diag
     # M_inv = lambda r: r
 
-    Ax = lambda x: pic_normal_matvec(x, indices, weights, n_cells.item(),
+    Ax = lambda x: pic_normal_matvec(x, indices, weights, n_cells,
                                      lambda_smooth, lap_fn)
 
     # RHS: 1/n_obs Σ_k T_kᵀ y_k
@@ -702,12 +706,12 @@ if __name__ == "__main__":
     # logdir = f"/home/laurin/workspace/PyHySCO/data/results/debug/tensor_logs/{timestamp}"
     # os.makedirs(logdir, exist_ok=True)
     # jax.profiler.start_trace(logdir)
-    start_time = time.time()
+    # start_time = time.time()
 
     image_config_file = "/home/laurin/workspace/PyHySCO/data/raw/highres/image_config.json"
     device =  'cpu'
     pair_idx = [0,1,2,3]
-    pair_idx = 0
+    # pair_idx = 0
     data = MultiPeDtiData(image_config_file, device=device, dtype=torch.float32, pair_idx=pair_idx)
 
     target_res = [*data.m[:-2], 128, 128]
@@ -785,6 +789,3 @@ if __name__ == "__main__":
       "/home/laurin/workspace/PyHySCO/data/results/debug/jax_recon.nii.gz")
 
     x = 1
-
-    end = time.time()
-    print(f"Took {end - start_time:.4f} seconds")
