@@ -25,7 +25,7 @@ from functools import partial
 from typing import Tuple
 
 import os
-os.environ["JAX_PLATFORM_NAME"] = "cpu"
+# os.environ["JAX_PLATFORM_NAME"] = "cpu"
 # os.environ["XLA_FLAGS"] = "--xla_gpu_enable_tracing=true"
 
 
@@ -39,11 +39,9 @@ from jax import lax
 import jax.profiler
 from jax.experimental import sparse
 from jax.scipy.sparse.linalg import cg
-from jax.scipy.optimize import minimize
 import os
 import time
-import optax
-import jaxopt
+
 # from triton.backends.nvidia.compiler import min_dot_size
 
 # jax.config.update("jax_disable_jit", True)
@@ -128,7 +126,6 @@ def build_pic_stencils_3d(
     Dz, Dy, Dx = m_source
     Pz, Py, Px = m_target
     n_cells     = Dz * Dy * Dx
-    n_particles = Pz * Py * Px
 
     extent      = omega[1::2] - omega[0::2]          # (Lz,Ly,Lx)
     cell_sz     = extent / jnp.array(m_source)       # Δz,Δy,Δx
@@ -179,8 +176,8 @@ def build_pic_stencils_3d(
                 Blist.append(Bij)
                 pp += 1
 
-    I = jnp.stack(Ilist, 0).reshape(stencil_sz, n_particles).T
-    B = jnp.stack(Blist, 0).reshape(stencil_sz, n_particles).T
+    I = jnp.stack(Ilist, 0).reshape(stencil_sz, n_cells).T
+    B = jnp.stack(Blist, 0).reshape(stencil_sz, n_cells).T
 
     if return_jacobian:
         Jac = jnp.zeros(n_cells, B.dtype).at[
@@ -247,18 +244,6 @@ def pic_adjoint(y: jnp.ndarray,
 def pic_forward(rho, indices, weights, n_cells):
     idx = indices.reshape(-1)
     val = (rho[:, None] * weights).reshape(-1)
-    # return lax.scatter_add(
-    #     jnp.zeros(n_cells, dtype=val.dtype),
-    #     jnp.expand_dims(idx, axis=1),
-    #     val,
-    #     dimension_numbers=lax.ScatterDimensionNumbers(
-    #         update_window_dims=(),            # scalar updates
-    #         inserted_window_dims=(0,),        # each update is inserted into a scalar slot
-    #         scatter_dims_to_operand_dims=(0,) # map idx[*, 0] to output dim 0
-    #     ),
-    #     indices_are_sorted=False,
-    #     unique_indices=False
-    # )
     return jnp.zeros(n_cells).at[idx].add(val)
 
 @partial(jax.jit, static_argnums=(3,4,5))
@@ -303,7 +288,7 @@ def pic_normal_matvec_jit(rho: jnp.ndarray,
 
 def diag_precond(indices: jnp.ndarray, weights: jnp.ndarray, n_particles: int) -> jnp.ndarray:
     """Return   diag(Tᵀ T)   to be used as a Jacobi PC."""
-    w2 = jnp.sum(weights ** 2, axis=[0,2])
+    w2 = jnp.sum(weights ** 2, axis=[0,2])         # (N,)  per particle sum
     return jnp.maximum(w2, 1e-6)             # avoid divide‑by‑0
 
 ################################################################################
@@ -368,6 +353,44 @@ def tikhonov_like_3d_full(r, spatial_size):
 
     return (dzt + dyt + dxt).reshape(-1)
 
+@partial(jax.jit, static_argnums=(4,5,7))
+def solve_lsq_vol(
+    rho_init: jnp.ndarray,              # (n_cells,)
+    observations: jnp.ndarray,          # (n_obs, n_cells)
+    indices: jnp.ndarray,               # (n_obs, N, K)
+    weights: jnp.ndarray,               # (n_obs, N, K)
+    m_recon: jnp.ndarray,
+    m_distorted: jnp.ndarray,
+    diag,
+    lambda_smooth: float = 0.01,
+):
+    n_particles = m_recon[0]*m_recon[1]*m_recon[2]
+    n_cells = m_distorted[0]*m_distorted[1]*m_distorted[2]
+
+    # lap_fn = tikhonov_like_3d(m_recon[0], m_recon[1], m_recon[2])
+
+    # Pre‑conditioner (Jacobi)
+
+    M_inv = lambda r: r / diag
+    # M_inv = lambda r: r
+
+    Ax = lambda x: pic_normal_matvec_jit(x, indices, weights, n_cells,
+                                     lambda_smooth, m_recon)
+
+    # RHS: 1/n_obs Σ_k T_kᵀ y_k
+    rhs = jnp.zeros(n_particles)
+    for k in range(observations.shape[0]):
+        rhs += pic_adjoint(observations[k], indices[k], weights[k])
+    rhs /= observations.shape[0]
+
+    # rho_est = pcg(Ax, rhs, M_inv, rho_init, tol=1e-8, maxiter=10)
+    rho_est, _ = cg(Ax, rhs, M=M_inv, x0=rho_init, tol=1e-8, maxiter=10)
+    return rho_est
+
+################################################################################
+# 7.  Example usage                                                             #
+################################################################################
+
 @partial(jax.jit, static_argnums=(1,2,6))
 def solve_one_vol(vol_obs,  # (n_obs, H, W)  – PE/RPE stack
                   m_recon,
@@ -387,8 +410,8 @@ def solve_one_vol(vol_obs,  # (n_obs, H, W)  – PE/RPE stack
     n_cells = m_distorted[0]*m_distorted[1]*m_distorted[2]
 
 
-    # M_inv = lambda r: r / diag
-    M_inv = lambda r: r
+    M_inv = lambda r: r / diag
+    # M_inv = lambda r: r
 
     Ax = lambda x: pic_normal_matvec_jit(x, indices, weights, n_cells,
                                      lambda_smooth, m_recon)
@@ -400,9 +423,7 @@ def solve_one_vol(vol_obs,  # (n_obs, H, W)  – PE/RPE stack
     rhs /= y.shape[0]
 
     rho_est, _ = cg(Ax, rhs, M=M_inv, x0=rho_init, tol=1e-8, maxiter=10)
-    loss = ((rho_est-rhs)**2).sum()
-
-    return rho_est, loss
+    return rho_est
 
 
 # @jax.jit
@@ -415,7 +436,6 @@ def batch_solve(observations, omega_recon, m_recon, m_distorted, xp):
     obs_res = observations.transpose(1,0,2,3,4)
     idx_all = []
     w_all = []
-
     for xp_grid in xp_flat:
 
         idx, w = build_pic_stencils_3d(omega_recon, m_recon, m_distorted, xp_grid)
@@ -428,166 +448,19 @@ def batch_solve(observations, omega_recon, m_recon, m_distorted, xp):
     lambda_smooth = 0.1
     diag = diag_precond(idx, w, n_particles) + lambda_smooth
 
+    batch_size = 12
+    N = obs_res.shape[0]
     solve_fn = lambda obs: solve_one_vol(obs, m_recon, m_distorted,
-                                         idx, w, diag, lambda_smooth=lambda_smooth)
-    def scan_body(carry, obs):
-        result = solve_fn(obs)  # could be tuple (rho_est, residuals)
-        return carry, result     # carry stays unused, just return result
+                                          idx, w, diag, lambda_smooth=lambda_smooth)
+    results = []
+    for i in range(0, N, batch_size):
+        chunk = obs_res[i:i + batch_size]
+        result = jax.vmap(solve_fn)(chunk)  # only apply vmap to a smaller chunk
+        results.append(result)
+    results = jnp.concatenate(results, axis=0)
 
-    _, outputs = jax.lax.scan(scan_body, None, obs_res)
+    return results
 
-    return outputs  # shape: (N, ...) — depending on what solve_fn returns
-
-# def bc_to_xp(bc, xp_base, data, target_res):
-#     # Recompute the shifted, rotated particle grid from bc
-#     image_center = 0.5 * (
-#             torch.tensor(data.omega[3::2]) + torch.tensor(
-#         data.omega[2::2]))  # (x_c, y_c, z_c)
-#     image_center = jnp.array(image_center.numpy())
-#
-#     xp_lins = []
-#     for pair_index, pair in enumerate(data.image_pairs):
-#
-#         # rot_mat_permuted = jnp.linalg.inv(data.rel_mats[pair_index][:3, :3].numpy())
-#         rot_mat_permuted = jnp.array(data.rel_mats[pair_index][:3, :3].numpy())
-#
-#         xp_pe = xp_base + pe.phase_sign * bc
-#         xp_lin = xp_pe.reshape(3, -1)
-#         xp_lin = rot_mat_permuted @ (xp_lin - image_center.reshape(-1,
-#                                                                    1)) + image_center.reshape(
-#             -1, 1)
-#         xp_lin = xp_lin.reshape(3, *target_res)
-#         xp_lins.append(xp_lin)
-#
-#         xp_rpe = xp_base + rpe.phase_sign * bc
-#         xp_lin = xp_rpe.reshape(3, -1)
-#         xp_lin = rot_mat_permuted @ (xp_lin - image_center.reshape(-1,
-#                                                                    1)) + image_center.reshape(
-#             -1, 1)
-#         xp_lin = xp_lin.reshape(3, *target_res)
-#         xp_lins.append(xp_lin)
-#
-#     xp_lins = jnp.stack(xp_lins)
-#
-#     return xp_lins
-
-def bc_to_xp(bc, xp_base, data, target_res):
-    # Recompute the shifted, rotated particle grid from bc
-
-    image_center = 0.5 * (
-            torch.tensor(data.omega[3::2]) + torch.tensor(
-        data.omega[2::2]))  # (x_c, y_c, z_c)
-    image_center = jnp.array(image_center.numpy())
-
-    ref_mat = jnp.array(data.mats[0].numpy())
-    xp_lins = []
-    for pair_index, pair in enumerate(data.image_pairs):
-
-        roi_mat = jnp.array(data.mats[pair_index].numpy())
-        T_mat_permuted = jnp.linalg.inv(roi_mat) @ ref_mat
-        rot_mat_permuted = T_mat_permuted[:3, :3]
-
-        xp_pe = xp_base + pair[0].phase_sign * bc
-        xp_lin = xp_pe.reshape(3, -1)
-        xp_lin = rot_mat_permuted @ (xp_lin - image_center.reshape(-1,
-                                                                   1)) + image_center.reshape(
-            -1, 1)
-        xp_lin = xp_lin.reshape(3, *target_res)
-        xp_lins.append(xp_lin)
-
-        xp_rpe = xp_base + pair[1].phase_sign * bc
-        xp_lin = xp_rpe.reshape(3, -1)
-        xp_lin = rot_mat_permuted @ (xp_lin - image_center.reshape(-1,
-                                                                   1)) + image_center.reshape(
-            -1, 1)
-        xp_lin = xp_lin.reshape(3, *target_res)
-        xp_lins.append(xp_lin)
-
-    xp_lins = jnp.stack(xp_lins)
-
-    return xp_lins
-
-
-def loss_and_grad(bc, xp_base, vols, omega, target_res, m_distorted, data):
-    def loss_fn(bc):
-        # Convert bc into spatially-shifted coordinates
-        xp = bc_to_xp(bc, xp_base, data, target_res)
-
-        # Run the forward solver (reconstruction)
-        recon, loss = batch_solve(vols, omega, target_res, m_distorted, xp)
-
-        return loss.mean(), recon
-
-    return jax.value_and_grad(loss_fn, has_aux=True)(bc)
-
-def laplacian_3d(v):
-    """Discrete 3-D Laplacian with Neumann (zero-grad) boundaries.
-
-    v: (..., D, H, W)  or  (..., H, W)   (it works for both)
-    returns same shape
-    """
-    # forward differences
-    dz = jnp.roll(v, -1, axis=-3) - v if v.ndim >= 3 else 0.0
-    dy = jnp.roll(v, -1, axis=-2) - v
-    dx = jnp.roll(v, -1, axis=-1) - v
-
-    # zero at far boundary
-    if v.ndim >= 3:
-        dz = dz.at[..., -1, :, :].set(0.0)
-    dy = dy.at[..., -1, :].set(0.0)
-    dx = dx.at[..., :, -1].set(0.0)
-
-    # backward diff of forward diff
-    dzt = -(dz - jnp.roll(dz, 1, axis=-3)) if v.ndim >= 3 else 0.0
-    dyt = -(dy - jnp.roll(dy, 1, axis=-2))
-    dxt = -(dx - jnp.roll(dx, 1, axis=-1))
-
-    if v.ndim >= 3:
-        dzt = dzt.at[..., 0, :, :].set(0.0)
-    dyt = dyt.at[..., 0, :].set(0.0)
-    dxt = dxt.at[..., :, 0].set(0.0)
-
-    return dzt + dyt + dxt
-
-
-def total_loss_fn(bc_3d_flat, unflatten_fn):
-    bc_3d = unflatten_fn(bc_3d_flat)
-    (data_term, _), _ = loss_and_grad(bc_3d, ...)
-    lap = laplacian_3d(bc_3d)
-    smooth_term = jnp.sum(lap ** 2)
-    return data_term + lambda_bc * smooth_term
-
-
-def make_loss_fn(unflatten_fn, xp_base, vols, omega, target_res, m_distorted, data):
-    def loss_fn(flat_bc):
-        bc_3d = unflatten_fn(flat_bc)
-        (data_term, _), _ = loss_and_grad(bc_3d, xp_base, vols, omega, target_res, m_distorted, data)
-        lap = laplacian_3d(bc_3d)
-        smooth_term = jnp.sum(lap ** 2)
-        return data_term + lambda_bc * smooth_term
-
-    return loss_fn
-
-# def make_loss_fn(xp_base, vols, omega, target_res, m_distorted, data):
-#     def loss_fn(bc_3d):
-#         (data_term, _), _ = loss_and_grad(bc_3d, xp_base, vols, omega, target_res, m_distorted, data)
-#         lap = laplacian_3d(bc_3d)
-#         smooth_term = jnp.sum(lap ** 2)
-#         return data_term + lambda_bc * smooth_term
-#
-#     return loss_fn
-
-def smooth_loss_fn(x):
-    lap = laplacian_3d(x)
-    return jnp.sum(lap ** 2)
-
-
-def total_loss(bc, xp_base, vols, omega, target_res, m_distorted, data):
-    xp = bc_to_xp(bc, xp_base, data, target_res)
-    recon, residuals = batch_solve(vols, omega, target_res, m_distorted, xp)
-    data_term = jnp.sum(residuals ** 2)
-    smooth_term = jnp.sum(laplacian_3d(bc) ** 2)
-    return data_term + lambda_bc * smooth_term
 
 if __name__ == "__main__":
     import numpy as np
@@ -598,22 +471,16 @@ if __name__ == "__main__":
     # jax.profiler.start_trace(logdir)
     start_time = time.time()
 
-    image_config_file = "/home/laurin/workspace/PyHySCO/data/raw/lowres/image_config.json"
+    image_config_file = "/home/laurin/workspace/PyHySCO/data/raw/highres/image_config.json"
     device =  'cpu'
     pair_idx = [0,1,2,3]
     # pair_idx = 0
     data = MultiPeDtiData(image_config_file, device=device, dtype=torch.float32, pair_idx=pair_idx)
 
-    target_res = [*data.m[:-2], 66, 66]
+    target_res = [*data.m[:-2], 128, 128]
     target_res = torch.tensor(target_res, dtype=torch.int32, device=device)
     initialization = InitializeCFMultiePeDtiDataResampled()
     B0 = initialization.eval(data, target_res, blur_result=True)
-
-
-    target_res = jnp.array(target_res.numpy())
-    m_distorted = jnp.array(data.m.numpy())
-    omega = data.omega.numpy()
-
 
     avg_op = myAvg1D(data.omega[2:], target_res[1:], device=device, dtype=torch.float32)
     # B0_res = B0.reshape(-1,1)
@@ -623,78 +490,71 @@ if __name__ == "__main__":
                              dtype=torch.float32)
     bc_3d = (bc * v_pe.view(1, -1)).T  # shift vector in original space
     bc_3d = bc_3d.reshape(3, *target_res[1:])
+    bc_2d = bc_3d[1:]
     bc_3d = jnp.array(bc_3d)
 
+    target_res = jnp.array(target_res.numpy())
+    m_distorted = jnp.array(data.m.numpy())
+    omega = data.omega.numpy()
+
     xp_base = get_cell_centered_grid(omega[2:], target_res[1:], return_all=True)
-    xp_base = xp_base.transpose(1, 0)
+    xp_base = xp_base.transpose(1,0)
     xp_base = xp_base.reshape(3, *target_res[-3:])
 
+    image_center = 0.5 * (
+            torch.tensor(data.omega[3::2]) + torch.tensor(
+        data.omega[2::2]))  # (x_c, y_c, z_c)
+    image_center = jnp.array(image_center.numpy())
+    image_center_res = image_center.reshape(3,1,1,1)
+
     vols = []
+    xp_lins = []
     for pair_index, pair in enumerate(data.image_pairs):
         pe, rpe = pair
         vols.append(jnp.array(pe.data.numpy()))
         vols.append(jnp.array(rpe.data.numpy()))
 
+        # rot_mat_permuted = jnp.linalg.inv(data.rel_mats[pair_index][:3, :3].numpy())
+        rot_mat_permuted = jnp.array(data.rel_mats[pair_index][:3, :3].numpy())
+
+
+        xp_pe = xp_base + pe.phase_sign * bc_3d
+        xp_lin = xp_pe.reshape(3,-1)
+        xp_lin = rot_mat_permuted @ (xp_lin - image_center.reshape(-1,1)) + image_center.reshape(-1,1)
+        xp_lin = xp_lin.reshape(3, *target_res[1:])
+        xp_lins.append(xp_lin)
+
+        xp_rpe = xp_base + rpe.phase_sign * bc_3d
+        xp_lin = xp_rpe.reshape(3, -1)
+        xp_lin = rot_mat_permuted @ (xp_lin - image_center.reshape(-1,1))  + image_center.reshape(-1,1)
+        xp_lin = xp_lin.reshape(3, *target_res[1:])
+        xp_lins.append(xp_lin)
+
+    xp_lins = jnp.stack(xp_lins)
+
     dwi_images = jnp.stack(vols)
     n_obs, n_vol, D, H, W = dwi_images.shape
-
 
     target_res_tuple = (
     target_res[1].item(), target_res[2].item(), target_res[3].item())
     m_distorted_tuple = (
     m_distorted[1].item(), m_distorted[2].item(), m_distorted[3].item())
-    lambda_bc = 10
 
-    # bc_flat, unflatten = jax.flatten_util.ravel_pytree(bc_3d)
+    # Run solver
+    _, _, n_slices, H, W = dwi_images.shape
+    recon = batch_solve(dwi_images,
+                        omega_recon=jnp.array(omega[2:], dtype=jnp.float32),
+                        m_recon=target_res_tuple,
+                        m_distorted=m_distorted_tuple,
+                        xp=xp_lins)
 
-    omega_3d = jnp.array(omega[2:], dtype=jnp.float32)
-    # loss_fn = make_loss_fn(unflatten, xp_base, dwi_images, omega_3d, target_res_tuple, m_distorted_tuple, data)
-    #
-    # # Optional: flatten bc if needed
-    # x0 = bc_flat  # can be any JAX array or pytree
-    # opt_options = dict(maxiter=5)
-    # result = minimize(loss_fn, x0, method="BFGS", options=opt_options)  # or "L-BFGS-B", etc.
-    #
-    # bc_optimized = result.x
-    # bc_optimized = bc_optimized.reshape(3, 78, 25, 66, 66)
-    #
-    # save_jax_data(bc_optimized.transpose(3, 2, 1, 0),
-    #                   f"/home/laurin/workspace/PyHySCO/data/results/debug/bc_3d_opt.nii.gz")
+    recon = recon.reshape(recon.shape[0], *target_res[-3:])
+    recon = recon.transpose(3,2,1,0)
+    save_jax_data(recon,
+      "/home/laurin/workspace/PyHySCO/data/results/debug/jax_recon.nii.gz")
 
+    x = 1
 
-    opt = optax.adam(learning_rate=0.5)
-
-    # bc_flat, unflatten = jax.flatten_util.ravel_pytree(bc_3d)
-    opt_state = opt.init(bc_3d)
-    num_steps = 15
-    # loss_fn = make_loss_fn(unflatten, xp_base, dwi_images, omega_3d, target_res_tuple, m_distorted_tuple, data)
-
-    for step in range(num_steps):
-        (data_term, recon), data_grad = loss_and_grad(bc_3d, xp_base, dwi_images, omega_3d, target_res_tuple, m_distorted_tuple, data)
-
-        # lap = laplacian_3d(bc_3d)
-        smooth_term = smooth_loss_fn(bc_3d)
-        smooth_grad = jax.grad(smooth_loss_fn)(bc_3d)
-
-        total_grad = data_grad + lambda_bc * smooth_grad
-
-        total_loss = data_term + lambda_bc * smooth_term
-
-        updates, opt_state = opt.update(total_grad, opt_state, params=bc_3d)
-
-        bc_3d = optax.apply_updates(bc_3d, updates)
-
-        print(f"{step}: loss = {total_loss:.4e}")
-
-        save_jax_data(recon.reshape(*target_res).transpose(3, 2, 1, 0),
-                      f"/home/laurin/workspace/PyHySCO/data/results/debug/recon_{step}.nii.gz")
-        save_jax_data(total_grad.transpose(3, 2, 1, 0),
-                      f"/home/laurin/workspace/PyHySCO/data/results/debug/grad_{step}.nii.gz")
-        save_jax_data(bc_3d.transpose(3, 2, 1, 0),
-                      f"/home/laurin/workspace/PyHySCO/data/results/debug/bc_3d_{step}.nii.gz")
-        save_jax_data(smooth_grad.transpose(3, 2, 1, 0),
-                      f"/home/laurin/workspace/PyHySCO/data/results/debug/grad_smooth_{step}.nii.gz")
-        save_jax_data(data_grad.transpose(3, 2, 1, 0),
-                      f"/home/laurin/workspace/PyHySCO/data/results/debug/grad_data_{step}.nii.gz")
-
-
+    end = time.time()
+    print(f"Took {end - start_time:.4f} seconds")
+    # jax.profiler.stop_trace()

@@ -438,69 +438,34 @@ def batch_solve(observations, omega_recon, m_recon, m_distorted, xp):
 
     return outputs  # shape: (N, ...) — depending on what solve_fn returns
 
-# def bc_to_xp(bc, xp_base, data, target_res):
-#     # Recompute the shifted, rotated particle grid from bc
-#     image_center = 0.5 * (
-#             torch.tensor(data.omega[3::2]) + torch.tensor(
-#         data.omega[2::2]))  # (x_c, y_c, z_c)
-#     image_center = jnp.array(image_center.numpy())
-#
-#     xp_lins = []
-#     for pair_index, pair in enumerate(data.image_pairs):
-#
-#         # rot_mat_permuted = jnp.linalg.inv(data.rel_mats[pair_index][:3, :3].numpy())
-#         rot_mat_permuted = jnp.array(data.rel_mats[pair_index][:3, :3].numpy())
-#
-#         xp_pe = xp_base + pe.phase_sign * bc
-#         xp_lin = xp_pe.reshape(3, -1)
-#         xp_lin = rot_mat_permuted @ (xp_lin - image_center.reshape(-1,
-#                                                                    1)) + image_center.reshape(
-#             -1, 1)
-#         xp_lin = xp_lin.reshape(3, *target_res)
-#         xp_lins.append(xp_lin)
-#
-#         xp_rpe = xp_base + rpe.phase_sign * bc
-#         xp_lin = xp_rpe.reshape(3, -1)
-#         xp_lin = rot_mat_permuted @ (xp_lin - image_center.reshape(-1,
-#                                                                    1)) + image_center.reshape(
-#             -1, 1)
-#         xp_lin = xp_lin.reshape(3, *target_res)
-#         xp_lins.append(xp_lin)
-#
-#     xp_lins = jnp.stack(xp_lins)
-#
-#     return xp_lins
-
 def bc_to_xp(bc, xp_base, data, target_res):
     # Recompute the shifted, rotated particle grid from bc
-
-    image_center = 0.5 * (
-            torch.tensor(data.omega[3::2]) + torch.tensor(
-        data.omega[2::2]))  # (x_c, y_c, z_c)
-    image_center = jnp.array(image_center.numpy())
 
     ref_mat = jnp.array(data.mats[0].numpy())
     xp_lins = []
     for pair_index, pair in enumerate(data.image_pairs):
 
         roi_mat = jnp.array(data.mats[pair_index].numpy())
-        T_mat_permuted = jnp.linalg.inv(roi_mat) @ ref_mat
-        rot_mat_permuted = T_mat_permuted[:3, :3]
+        T_mat_permuted = jnp.linalg.inv(roi_mat)
 
-        xp_pe = xp_base + pair[0].phase_sign * bc
+        # xp_pe = xp_base + pair[0].phase_sign * bc.reshape(3,-1)
+        xp_pe = xp_base
         xp_lin = xp_pe.reshape(3, -1)
-        xp_lin = rot_mat_permuted @ (xp_lin - image_center.reshape(-1,
-                                                                   1)) + image_center.reshape(
-            -1, 1)
-        xp_lin = xp_lin.reshape(3, *target_res)
+        ones = jnp.ones((1, xp_lin.shape[1]))
+        xp_lin = jnp.vstack([xp_lin, ones])
+        xp_lin = T_mat_permuted @ xp_lin
+        xp_lin = xp_lin[:3].reshape(3, *target_res)
         xp_lins.append(xp_lin)
 
-        xp_rpe = xp_base + pair[1].phase_sign * bc
+        print(T_mat_permuted)
+
+        # xp_rpe = xp_base + pair[1].phase_sign * bc.reshape(3,-1)
+        xp_rpe = xp_base
         xp_lin = xp_rpe.reshape(3, -1)
-        xp_lin = rot_mat_permuted @ (xp_lin - image_center.reshape(-1,
-                                                                   1)) + image_center.reshape(
-            -1, 1)
-        xp_lin = xp_lin.reshape(3, *target_res)
+        ones = jnp.ones((1, xp_lin.shape[1]))
+        xp_lin = jnp.vstack([xp_lin, ones])
+        xp_lin = T_mat_permuted @ xp_lin
+        xp_lin = xp_lin[:3].reshape(3, *target_res)
         xp_lins.append(xp_lin)
 
     xp_lins = jnp.stack(xp_lins)
@@ -629,6 +594,14 @@ if __name__ == "__main__":
     xp_base = xp_base.transpose(1, 0)
     xp_base = xp_base.reshape(3, *target_res[-3:])
 
+    T_world = jnp.array(data.mats[0])
+    xp_base = xp_base.reshape(3, -1)
+    ones = jnp.ones((1, xp_base.shape[1]))
+    xp_base = jnp.vstack([xp_base, ones])
+    xp_base_world = T_world @ xp_base
+    xp_base_world = xp_base_world[0:3]
+
+
     vols = []
     for pair_index, pair in enumerate(data.image_pairs):
         pe, rpe = pair
@@ -666,11 +639,11 @@ if __name__ == "__main__":
 
     # bc_flat, unflatten = jax.flatten_util.ravel_pytree(bc_3d)
     opt_state = opt.init(bc_3d)
-    num_steps = 15
+    num_steps = 1
     # loss_fn = make_loss_fn(unflatten, xp_base, dwi_images, omega_3d, target_res_tuple, m_distorted_tuple, data)
 
     for step in range(num_steps):
-        (data_term, recon), data_grad = loss_and_grad(bc_3d, xp_base, dwi_images, omega_3d, target_res_tuple, m_distorted_tuple, data)
+        (data_term, recon), data_grad = loss_and_grad(bc_3d, xp_base_world, dwi_images, omega_3d, target_res_tuple, m_distorted_tuple, data)
 
         # lap = laplacian_3d(bc_3d)
         smooth_term = smooth_loss_fn(bc_3d)

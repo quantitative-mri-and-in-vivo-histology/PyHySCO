@@ -288,7 +288,7 @@ def main():
     parser.add_argument("--PC", default=JacobiCG, help="Preconditioner to use (default=JacobiCG)")
 
     device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
-    # device = 'cpu'
+    device = 'cpu'
     # print(device)
 
     args = parser.parse_args()
@@ -305,6 +305,7 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     pair_idx = [0,1,2,3]
+    pair_idx = 0
     data = MultiPeDataObject(args.image_config, device=device, dtype=dtype, pair_idx=pair_idx, first_vol_only=True)
 
 
@@ -327,7 +328,7 @@ def main():
                 os.path.join(args.output_dir, 'EstFieldMap.nii.gz'))
 
 
-    rel_mat = data.rel_mats[1]
+    # rel_mat = data.rel_mats[1]
 
     pair_idx = [0, 1, 2, 3]
     data = MultiPeDataObject(args.image_config, device=device, dtype=dtype, pair_idx=pair_idx, first_vol_only=False)

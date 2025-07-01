@@ -123,12 +123,12 @@ class MultiPeDtiData:
             mat = dwi_series_pe.affine
 
             mat = torch.tensor(mat, dtype=dtype, device=device)
-            pe_rpe_mats.append(mat)
-            rel_mat = torch.linalg.inv(pe_rpe_mats[image_pair_index]) @ pe_rpe_mats[0]
+            # pe_rpe_mats.append(mat)
+
             # rel_mat = pe_rpe_mats[0] @ torch.linalg.inv(pe_rpe_mats[image_pair_index])
 
             # rel_mat = np.linalg.inv(pe_rpe_mats[0] @ pe_rpe_mats[image_pair_index])
-            rel_mat = torch.tensor(rel_mat, dtype=dtype, device=device)
+            # rel_mat = torch.tensor(rel_mat, dtype=dtype, device=device)
 
             m = torch.tensor(rho0.shape, dtype=torch.int, device=device)
             dim = torch.numel(m)
@@ -245,9 +245,15 @@ class MultiPeDtiData:
             pe_rpe_permute_back.append(permute_back)
             pe_rpe_permute.append(permute)
 
-            rel_mat = permute_affine_axes(rel_mat, permute[1:])
 
+            mat = permute_affine_axes(mat, permute[1:])
+            pe_rpe_mats.append(mat)
+
+            rel_mat = torch.linalg.inv(mat) @ \
+                      pe_rpe_mats[0]
+            # rel_mat = permute_affine_axes(rel_mat, permute[1:])
             pe_rpe_rel_mats.append(rel_mat)
+            # pe_rpe_mats.append(mat)
 
 
         return pe_rpe_image_pairs, omega, m, h, pe_rpe_permute, pe_rpe_permute_back, pe_rpe_mats, pe_rpe_rel_mats

@@ -2,9 +2,9 @@ import torch
 from EPI_MRI.ImageModels import *
 from EPI_MRI.InitializationMethods import *
 from EPI_MRI.Preconditioners import *
-import torchsparsegradutils as tsgu
+# import torchsparsegradutils as tsgu
 #import jax
-from torchsparsegradutils.jax import sparse_solve_j4t
+# from torchsparsegradutils.jax import sparse_solve_j4t
 #from torchsparsegradutils.cupy import sparse_solve_c4t
 from EPI_MRI.ParticleInCell2D import *
 from optimization.LinearSolvers import *
@@ -719,6 +719,7 @@ class EPIMRIDistortionCorrectionPush4dDtiProper:
 
             b0_weights = mean_b0_imgs/1000
             b0_weights = b0_weights**2
+            b0_weights = b0_weights*0 + 1
             save_data(weights.reshape(-1, *self.m_distorted[2:]).permute(1, 2, 0),
                       "/home/laurin/workspace/PyHySCO/data/results/debug/weights.nii.gz")
 

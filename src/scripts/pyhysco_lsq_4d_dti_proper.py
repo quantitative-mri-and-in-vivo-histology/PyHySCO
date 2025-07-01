@@ -8,6 +8,9 @@ from EPI_MRI.LeastSquaresCorrectionMultiPe import *
 from EPI_MRI.LeastSquaresCorrectionMultiPeSparse import *
 from EPI_MRI.LeastSquaresCorrectionMultiPeSparse4d import *
 from EPI_MRI.EPIMRIDistortionCorrectionPush4dDtiProper import *
+from EPI_MRI.EPIMRIDistortionCorrectionPush4dDtiWorking import *
+from EPI_MRI.EPIMRIDistortionCorrectionPush4dDtiWorkingTwo import *
+from EPI_MRI.EPIMRIDistortionCorrectionPush4dDtiPcg import *
 from EPI_MRI.MultiPeDtiData import MultiPeDtiData
 import argparse
 import warnings
@@ -46,7 +49,7 @@ def main():
 
 
     device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
-    # device = 'cpu'
+    device = 'cpu'
     # print(device)
 
     args = parser.parse_args()
@@ -62,8 +65,8 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    pair_idx = [0,1,2,3]
-    # pair_idx = 0
+    # pair_idx = [0,1,2,3]
+    pair_idx = 0
     data = MultiPeDtiData(args.image_config, device=device, dtype=dtype, pair_idx=pair_idx)
 
     target_res = [*data.m[:-2], 128, 128]
@@ -76,17 +79,28 @@ def main():
     save_data(B0_detached.reshape(list(m_plus(target_res[1:]))).permute(data.permute_back[0][1:]),
                 os.path.join(args.output_dir, 'EstFieldMap.nii.gz'), data.image_pairs[0][0].affine)
 
-    loss_func = EPIMRIDistortionCorrectionPush4dDtiProper(
+    loss_func = EPIMRIDistortionCorrectionPush4dDtiPcg(
         data,
         alpha=args.alpha,
         beta=args.beta,
-        lambda_smooth=args.lambda_smooth,
-        recon_size=target_res,
+        target_res=target_res[2:],
         averaging_operator=args.averaging,
         derivative_operator=args.derivative,
         regularizer=args.regularizer,
         rho=args.rho,
         PC=args.PC)
+
+    # loss_func = EPIMRIDistortionCorrectionPush4dDtiProper(
+    #     data,
+    #     alpha=args.alpha,
+    #     beta=args.beta,
+    #     lambda_smooth=args.lambda_smooth,
+    #     recon_size=target_res,
+    #     averaging_operator=args.averaging,
+    #     derivative_operator=args.derivative,
+    #     regularizer=args.regularizer,
+    #     rho=args.rho,
+    #     PC=args.PC)
 
     # change path to be where you want logfile and corrected images to be stored
     # opt = args.optimizer(loss_func, max_iter=args.max_iter, verbose=True, path=args.output_dir)

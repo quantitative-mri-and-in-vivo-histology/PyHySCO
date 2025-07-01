@@ -46,7 +46,7 @@ import optax
 import jaxopt
 # from triton.backends.nvidia.compiler import min_dot_size
 
-# jax.config.update("jax_disable_jit", True)
+jax.config.update("jax_disable_jit", True)
 
 from EPI_MRI.LinearOperators import myAvg1D
 from EPI_MRI.MultiPeDtiData import MultiPeDtiData
@@ -438,56 +438,20 @@ def batch_solve(observations, omega_recon, m_recon, m_distorted, xp):
 
     return outputs  # shape: (N, ...) — depending on what solve_fn returns
 
-# def bc_to_xp(bc, xp_base, data, target_res):
-#     # Recompute the shifted, rotated particle grid from bc
-#     image_center = 0.5 * (
-#             torch.tensor(data.omega[3::2]) + torch.tensor(
-#         data.omega[2::2]))  # (x_c, y_c, z_c)
-#     image_center = jnp.array(image_center.numpy())
-#
-#     xp_lins = []
-#     for pair_index, pair in enumerate(data.image_pairs):
-#
-#         # rot_mat_permuted = jnp.linalg.inv(data.rel_mats[pair_index][:3, :3].numpy())
-#         rot_mat_permuted = jnp.array(data.rel_mats[pair_index][:3, :3].numpy())
-#
-#         xp_pe = xp_base + pe.phase_sign * bc
-#         xp_lin = xp_pe.reshape(3, -1)
-#         xp_lin = rot_mat_permuted @ (xp_lin - image_center.reshape(-1,
-#                                                                    1)) + image_center.reshape(
-#             -1, 1)
-#         xp_lin = xp_lin.reshape(3, *target_res)
-#         xp_lins.append(xp_lin)
-#
-#         xp_rpe = xp_base + rpe.phase_sign * bc
-#         xp_lin = xp_rpe.reshape(3, -1)
-#         xp_lin = rot_mat_permuted @ (xp_lin - image_center.reshape(-1,
-#                                                                    1)) + image_center.reshape(
-#             -1, 1)
-#         xp_lin = xp_lin.reshape(3, *target_res)
-#         xp_lins.append(xp_lin)
-#
-#     xp_lins = jnp.stack(xp_lins)
-#
-#     return xp_lins
-
 def bc_to_xp(bc, xp_base, data, target_res):
     # Recompute the shifted, rotated particle grid from bc
-
     image_center = 0.5 * (
             torch.tensor(data.omega[3::2]) + torch.tensor(
         data.omega[2::2]))  # (x_c, y_c, z_c)
     image_center = jnp.array(image_center.numpy())
 
-    ref_mat = jnp.array(data.mats[0].numpy())
     xp_lins = []
     for pair_index, pair in enumerate(data.image_pairs):
 
-        roi_mat = jnp.array(data.mats[pair_index].numpy())
-        T_mat_permuted = jnp.linalg.inv(roi_mat) @ ref_mat
-        rot_mat_permuted = T_mat_permuted[:3, :3]
+        # rot_mat_permuted = jnp.linalg.inv(data.rel_mats[pair_index][:3, :3].numpy())
+        rot_mat_permuted = jnp.array(data.rel_mats[pair_index][:3, :3].numpy())
 
-        xp_pe = xp_base + pair[0].phase_sign * bc
+        xp_pe = xp_base + pe.phase_sign * bc
         xp_lin = xp_pe.reshape(3, -1)
         xp_lin = rot_mat_permuted @ (xp_lin - image_center.reshape(-1,
                                                                    1)) + image_center.reshape(
@@ -495,7 +459,7 @@ def bc_to_xp(bc, xp_base, data, target_res):
         xp_lin = xp_lin.reshape(3, *target_res)
         xp_lins.append(xp_lin)
 
-        xp_rpe = xp_base + pair[1].phase_sign * bc
+        xp_rpe = xp_base + rpe.phase_sign * bc
         xp_lin = xp_rpe.reshape(3, -1)
         xp_lin = rot_mat_permuted @ (xp_lin - image_center.reshape(-1,
                                                                    1)) + image_center.reshape(
@@ -548,6 +512,8 @@ def laplacian_3d(v):
     dxt = dxt.at[..., :, 0].set(0.0)
 
     return dzt + dyt + dxt
+
+
 
 
 def total_loss_fn(bc_3d_flat, unflatten_fn):
@@ -686,7 +652,7 @@ if __name__ == "__main__":
 
         print(f"{step}: loss = {total_loss:.4e}")
 
-        save_jax_data(recon.reshape(*target_res).transpose(3, 2, 1, 0),
+        save_jax_data(recon.reshape(78,25,66,66).transpose(3, 2, 1, 0),
                       f"/home/laurin/workspace/PyHySCO/data/results/debug/recon_{step}.nii.gz")
         save_jax_data(total_grad.transpose(3, 2, 1, 0),
                       f"/home/laurin/workspace/PyHySCO/data/results/debug/grad_{step}.nii.gz")
