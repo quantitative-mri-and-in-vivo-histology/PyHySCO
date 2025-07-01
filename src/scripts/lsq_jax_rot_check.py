@@ -446,26 +446,32 @@ def bc_to_xp(bc, xp_base, data, target_res):
     for pair_index, pair in enumerate(data.image_pairs):
 
         roi_mat = jnp.array(data.mats[pair_index].numpy())
-        T_mat_permuted = jnp.linalg.inv(roi_mat)
+        T_mat_permuted = jnp.linalg.inv(roi_mat) @ ref_mat
 
-        # xp_pe = xp_base + pair[0].phase_sign * bc.reshape(3,-1)
-        xp_pe = xp_base
+        xp_pe = xp_base + pair[0].phase_sign * bc
+        # xp_pe = xp_base
         xp_lin = xp_pe.reshape(3, -1)
         ones = jnp.ones((1, xp_lin.shape[1]))
         xp_lin = jnp.vstack([xp_lin, ones])
         xp_lin = T_mat_permuted @ xp_lin
         xp_lin = xp_lin[:3].reshape(3, *target_res)
+        xp_lin.at[0].set(xp_lin[0] / jnp.array(data.omega[3]))
+        xp_lin.at[1].set(xp_lin[1] / jnp.array(data.omega[5]))
+        xp_lin.at[2].set(xp_lin[2] / jnp.array(data.omega[7]))
         xp_lins.append(xp_lin)
 
-        print(T_mat_permuted)
+        # print(T_mat_permuted)
 
-        # xp_rpe = xp_base + pair[1].phase_sign * bc.reshape(3,-1)
-        xp_rpe = xp_base
+        xp_rpe = xp_base + pair[1].phase_sign * bc
+        # xp_rpe = xp_base
         xp_lin = xp_rpe.reshape(3, -1)
         ones = jnp.ones((1, xp_lin.shape[1]))
         xp_lin = jnp.vstack([xp_lin, ones])
         xp_lin = T_mat_permuted @ xp_lin
         xp_lin = xp_lin[:3].reshape(3, *target_res)
+        xp_lin.at[0].set(xp_lin[0] / jnp.array(data.omega[3]))
+        xp_lin.at[1].set(xp_lin[1] / jnp.array(data.omega[5]))
+        xp_lin.at[2].set(xp_lin[2] / jnp.array(data.omega[7]))
         xp_lins.append(xp_lin)
 
     xp_lins = jnp.stack(xp_lins)
@@ -594,12 +600,12 @@ if __name__ == "__main__":
     xp_base = xp_base.transpose(1, 0)
     xp_base = xp_base.reshape(3, *target_res[-3:])
 
-    T_world = jnp.array(data.mats[0])
-    xp_base = xp_base.reshape(3, -1)
-    ones = jnp.ones((1, xp_base.shape[1]))
-    xp_base = jnp.vstack([xp_base, ones])
-    xp_base_world = T_world @ xp_base
-    xp_base_world = xp_base_world[0:3]
+    # T_world = jnp.array(data.mats[0])
+    # xp_base = xp_base.reshape(3, -1)
+    # ones = jnp.ones((1, xp_base.shape[1]))
+    # xp_base = jnp.vstack([xp_base, ones])
+    # xp_base_world = T_world @ xp_base
+    # xp_base_world = xp_base_world[0:3]
 
 
     vols = []
@@ -643,7 +649,7 @@ if __name__ == "__main__":
     # loss_fn = make_loss_fn(unflatten, xp_base, dwi_images, omega_3d, target_res_tuple, m_distorted_tuple, data)
 
     for step in range(num_steps):
-        (data_term, recon), data_grad = loss_and_grad(bc_3d, xp_base_world, dwi_images, omega_3d, target_res_tuple, m_distorted_tuple, data)
+        (data_term, recon), data_grad = loss_and_grad(bc_3d, xp_base, dwi_images, omega_3d, target_res_tuple, m_distorted_tuple, data)
 
         # lap = laplacian_3d(bc_3d)
         smooth_term = smooth_loss_fn(bc_3d)
