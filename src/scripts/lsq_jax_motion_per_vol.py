@@ -46,14 +46,14 @@ import optax
 import jaxopt
 # from triton.backends.nvidia.compiler import min_dot_size
 
-# jax.config.update("jax_disable_jit", True)
+jax.config.update("jax_disable_jit", True)
 
 from EPI_MRI.LinearOperators import myAvg1D
 from EPI_MRI.MultiPeDtiData import MultiPeDtiData
 from EPI_MRI.InitializationMethods import InitializeCFMultiePeDtiDataResampled
 from EPI_MRI.utils import save_data
 import nibabel as nib
-
+from typing import NamedTuple
 
 
 
@@ -411,69 +411,99 @@ def batch_solve(observations, omega_recon, m_recon, m_distorted, xp):
     n_cells = m_distorted[0]*m_distorted[1]*m_distorted[2]
     n_particles = m_recon[0]*m_recon[1]*m_recon[2]
 
-    xp_flat = xp.reshape(*xp.shape[0:2], -1)
+    xp_flat = xp.reshape(*xp.shape[0:3], -1)
     obs_res = observations.transpose(1,0,2,3,4)
     idx_all = []
     w_all = []
 
-    for xp_grid in xp_flat:
+    for vol_index in range(xp_flat.shape[0]):
+        for pe_index in range(xp_flat.shape[1]):
 
-        idx, w = build_pic_stencils_3d(omega_recon, m_recon, m_distorted, xp_grid)
-        idx_all.append(idx)
-        w_all.append(w)
+            idx, w = build_pic_stencils_3d(omega_recon, m_recon, m_distorted, xp_flat[pe_index, vol_index])
+            idx_all.append(idx)
+            w_all.append(w)
 
     w = jnp.stack(w_all)
     idx = jnp.stack(idx_all)
 
+    idx = idx.reshape(xp_flat.shape[0], xp_flat.shape[1], *idx.shape[1:])
+    w = w.reshape(xp_flat.shape[0], xp_flat.shape[1], *w.shape[1:])
+
+
     lambda_smooth = 0.1
     diag = diag_precond(idx, w, n_particles) + lambda_smooth
 
-    solve_fn = lambda obs: solve_one_vol(obs, m_recon, m_distorted,
-                                         idx, w, diag, lambda_smooth=lambda_smooth)
-    def scan_body(carry, obs):
-        result = solve_fn(obs)  # could be tuple (rho_est, residuals)
-        return carry, result     # carry stays unused, just return result
+    solve_fn = lambda obs, indices, weights: solve_one_vol(obs, m_recon, m_distorted,
+                                         indices, weights, diag, lambda_smooth=lambda_smooth)
 
-    _, outputs = jax.lax.scan(scan_body, None, obs_res)
+    def scan_body(carry, xs):
+        obs, indices, weights = xs
+        result = solve_fn(obs, indices, weights)
+        return carry, result
+
+    _, outputs = jax.lax.scan(scan_body, None, (obs_res, idx, w))
 
     return outputs  # shape: (N, ...) — depending on what solve_fn returns
 
-def bc_to_xp(bc, xp_base, data, target_res):
+def bc_to_xp(bc, motion_mats, xp_base, data, target_res):
     # Recompute the shifted, rotated particle grid from bc
+
+    image_center = 0.5 * (
+            torch.tensor(data.omega[3::2]) + torch.tensor(
+        data.omega[2::2]))  # (x_c, y_c, z_c)
+    image_center = jnp.array(image_center.numpy())
+    image_center_res = image_center.reshape(3,1,1,1)
+
 
     ref_mat = jnp.array(data.mats[0].numpy())
     xp_lins = []
-    for pair_index, pair in enumerate(data.image_pairs):
 
-        roi_mat = jnp.array(data.mats[pair_index].numpy())
-        T_mat_permuted = jnp.linalg.inv(roi_mat) @ ref_mat
+    for vol_index in range(motion_mats.shape[1]):
 
-        xp_pe = xp_base + pair[0].phase_sign * bc
-        # xp_pe = xp_base
-        xp_lin = xp_pe.reshape(3, -1)
-        ones = jnp.ones((1, xp_lin.shape[1]))
-        xp_lin = jnp.vstack([xp_lin, ones])
-        xp_lin = T_mat_permuted @ xp_lin
-        xp_lin = xp_lin[:3].reshape(3, *target_res)
-        xp_lin.at[0].set(xp_lin[0] / jnp.array(data.omega[3]))
-        xp_lin.at[1].set(xp_lin[1] / jnp.array(data.omega[5]))
-        xp_lin.at[2].set(xp_lin[2] / jnp.array(data.omega[7]))
-        xp_lins.append(xp_lin)
+        xp_lins_per_vol = []
 
-        # print(T_mat_permuted)
+        for pair_index, pair in enumerate(data.image_pairs):
 
-        xp_rpe = xp_base + pair[1].phase_sign * bc
-        # xp_rpe = xp_base
-        xp_lin = xp_rpe.reshape(3, -1)
-        ones = jnp.ones((1, xp_lin.shape[1]))
-        xp_lin = jnp.vstack([xp_lin, ones])
-        xp_lin = T_mat_permuted @ xp_lin
-        xp_lin = xp_lin[:3].reshape(3, *target_res)
-        xp_lin.at[0].set(xp_lin[0] / jnp.array(data.omega[3]))
-        xp_lin.at[1].set(xp_lin[1] / jnp.array(data.omega[5]))
-        xp_lin.at[2].set(xp_lin[2] / jnp.array(data.omega[7]))
-        xp_lins.append(xp_lin)
+            T_motion_k_pe = motion_mats[2*pair_index][vol_index]              # canonical-mm → moved canonical-mm
+            T_motion_k_rpe = motion_mats[
+                2 * pair_index+1][vol_index]  # canonical-mm → moved canonical-mm
 
+            roi_mat = jnp.array(data.mats[pair_index].numpy())
+            T_mat_permuted = jnp.linalg.inv(roi_mat) @ ref_mat
+            T_voxel_to_mm = jnp.eye(4) * (1 / jnp.array(
+                [data.omega[3], data.omega[5], data.omega[7], 1]))
+            T_mm_to_voxel = jnp.eye(4) * (jnp.array(
+                [data.omega[3], data.omega[5], data.omega[7], 1]))
+            T_fixed = T_voxel_to_mm @ T_mat_permuted @ T_mm_to_voxel
+            rot_mat_permuted = T_mat_permuted[:3,:3]
+
+            xp_pe = xp_base.reshape(3,-1)
+            ones = jnp.ones((1, xp_pe.shape[1]))
+            xp_lin = jnp.vstack([xp_pe, ones])
+            # xp_lin = T_motion_k_pe @ xp_lin
+            xp_lin = xp_lin.at[0:3].add(pair[0].phase_sign * bc.reshape(3,-1))
+            xp_lin = rot_mat_permuted @ (xp_lin[0:3] - image_center.reshape(-1,
+                                                                       1)) + image_center.reshape(-1, 1)
+            ones = jnp.ones((1, xp_lin.shape[1]))
+            xp_lin = jnp.vstack([xp_lin, ones])
+            xp_lin = T_motion_k_pe @ xp_lin
+            xp_lins_per_vol.append(xp_lin[:3])
+
+
+            xp_rpe = xp_base.reshape(3,-1)
+            ones = jnp.ones((1, xp_rpe.shape[1]))
+            xp_lin = jnp.vstack([xp_pe, ones])
+            xp_lin = xp_lin.at[0:3].add(pair[1].phase_sign * bc.reshape(3,-1))
+            xp_lin = rot_mat_permuted @ (xp_lin[0:3] - image_center.reshape(-1,
+                                                                       1)) + image_center.reshape(-1, 1)
+            ones = jnp.ones((1, xp_lin.shape[1]))
+            xp_lin = jnp.vstack([xp_lin, ones])
+            xp_lin = T_motion_k_rpe @ xp_lin
+            xp_lins_per_vol.append(xp_lin[:3])
+
+
+        xp_lins_per_vol = jnp.stack(xp_lins_per_vol)
+        xp_lins.append(xp_lins_per_vol)
     xp_lins = jnp.stack(xp_lins)
 
     return xp_lins
@@ -560,19 +590,68 @@ def total_loss(bc, xp_base, vols, omega, target_res, m_distorted, data):
     smooth_term = jnp.sum(laplacian_3d(bc) ** 2)
     return data_term + lambda_bc * smooth_term
 
+
+def loss_fn(params, xp_base, vols, omega, target_res, m_distorted, data,
+            weight_bc, weight_motion):
+
+    # Convert each 6D theta to a 4x4 transformation matrix
+    def pose_to_matrix(theta_row):
+        t = theta_row[:3]
+        rx, ry, rz = theta_row[3:]
+        cx, sx = jnp.cos(rx), jnp.sin(rx)
+        cy, sy = jnp.cos(ry), jnp.sin(ry)
+        cz, sz = jnp.cos(rz), jnp.sin(rz)
+        R = jnp.array([
+            [ cz*cy,  cz*sy*sx - sz*cx,  cz*sy*cx + sz*sx ],
+            [ sz*cy,  sz*sy*sx + cz*cx,  sz*sy*cx - cz*sx ],
+            [  -sy ,          cy*sx   ,         cy*cx   ],
+        ])
+        M = jnp.eye(4)
+        M = M.at[:3, :3].set(R)
+        M = M.at[:3,  3].set(t)
+        return M
+
+    # motion_mats = jax.vmap(pose_to_matrix)(params.theta)
+    motion_mats = jax.vmap(jax.vmap(pose_to_matrix))(params.theta)
+
+    # Convert fieldmap and motion into sampling coordinates
+    xp = bc_to_xp(params.bc, motion_mats, xp_base, data, target_res)
+
+    # Solve forward model
+
+    # recon, data_loss = jax.checkpoint(batch_solve)(
+    #     vols, omega, target_res, m_distorted, xp
+    # )
+    recon, data_loss = batch_solve(vols, omega, target_res, m_distorted, xp)
+
+    # Compute data term
+    data_term = jnp.mean(data_loss)
+
+    # Regularization terms
+    smooth_term = jnp.sum(laplacian_3d(params.bc) ** 2)
+    motion_term = jnp.sum(params.theta ** 2)
+
+    total_loss = data_term + weight_bc * smooth_term + weight_motion * motion_term
+    return total_loss, (data_term, smooth_term, motion_term, recon)
+
+class Params(NamedTuple):
+    bc: jnp.ndarray        # fieldmap shift: shape (3, Dz, Dy, Dx)
+    theta: jnp.ndarray
+
+
 if __name__ == "__main__":
     import numpy as np
 
-    # timestamp = time.strftime("%Y-%m-%d_%H-%M-%S")
-    # logdir = f"/home/laurin/workspace/PyHySCO/data/results/debug/tensor_logs/{timestamp}"
-    # os.makedirs(logdir, exist_ok=True)
-    # jax.profiler.start_trace(logdir)
+    timestamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+    logdir = f"/home/laurin/workspace/PyHySCO/data/results/debug/tensor_logs/{timestamp}"
+    os.makedirs(logdir, exist_ok=True)
+    jax.profiler.start_trace(logdir)
     start_time = time.time()
 
     image_config_file = "/home/laurin/workspace/PyHySCO/data/raw/lowres/image_config.json"
     device =  'cpu'
     pair_idx = [0,1,2,3]
-    # pair_idx = 0
+    pair_idx = 0
     data = MultiPeDtiData(image_config_file, device=device, dtype=torch.float32, pair_idx=pair_idx)
 
     target_res = [*data.m[:-2], 66, 66]
@@ -614,66 +693,102 @@ if __name__ == "__main__":
         vols.append(jnp.array(pe.data.numpy()))
         vols.append(jnp.array(rpe.data.numpy()))
 
+
     dwi_images = jnp.stack(vols)
     n_obs, n_vol, D, H, W = dwi_images.shape
-
+    thetas = jnp.array([1e-3, 1e-3, 1e-3, 1e-3, 1e-3, 1e-3]).reshape(1, -1).repeat(dwi_images.shape[0]*dwi_images.shape[1],
+                                                                          axis=0).reshape(*dwi_images.shape[:2], 6)
 
     target_res_tuple = (
     target_res[1].item(), target_res[2].item(), target_res[3].item())
     m_distorted_tuple = (
     m_distorted[1].item(), m_distorted[2].item(), m_distorted[3].item())
     lambda_bc = 10
+    lambda_motion = 100000000
 
     # bc_flat, unflatten = jax.flatten_util.ravel_pytree(bc_3d)
 
     omega_3d = jnp.array(omega[2:], dtype=jnp.float32)
-    # loss_fn = make_loss_fn(unflatten, xp_base, dwi_images, omega_3d, target_res_tuple, m_distorted_tuple, data)
-    #
-    # # Optional: flatten bc if needed
-    # x0 = bc_flat  # can be any JAX array or pytree
-    # opt_options = dict(maxiter=5)
-    # result = minimize(loss_fn, x0, method="BFGS", options=opt_options)  # or "L-BFGS-B", etc.
-    #
-    # bc_optimized = result.x
-    # bc_optimized = bc_optimized.reshape(3, 78, 25, 66, 66)
-    #
-    # save_jax_data(bc_optimized.transpose(3, 2, 1, 0),
-    #                   f"/home/laurin/workspace/PyHySCO/data/results/debug/bc_3d_opt.nii.gz")
 
+    params = Params(
+        bc=bc_3d,  # your initial fieldmap
+        theta=thetas  # zeros of shape (N_pairs, 6)
+    )
 
-    opt = optax.adam(learning_rate=0.5)
+    tx = optax.multi_transform(
+        {
+            "bc": optax.adam(learning_rate=0.01),  # e.g. for fieldmap
+            "theta": optax.adam(learning_rate=0.001),  # e.g. for motion
+        },
+        param_labels={
+            "bc": "bc",
+            "theta": "theta",
+        }
+    )
 
-    # bc_flat, unflatten = jax.flatten_util.ravel_pytree(bc_3d)
-    opt_state = opt.init(bc_3d)
+    opt = optax.adam(learning_rate=0.01)
+
+    opt_state = opt.init(params)
     num_steps = 1
     # loss_fn = make_loss_fn(unflatten, xp_base, dwi_images, omega_3d, target_res_tuple, m_distorted_tuple, data)
 
     for step in range(num_steps):
-        (data_term, recon), data_grad = loss_and_grad(bc_3d, xp_base, dwi_images, omega_3d, target_res_tuple, m_distorted_tuple, data)
+        # (data_term, recon), data_grad = loss_and_grad(bc_3d, xp_base, dwi_images, omega_3d, target_res_tuple, m_distorted_tuple, data)
+        #
+        # # lap = laplacian_3d(bc_3d)
+        # smooth_term = smooth_loss_fn(bc_3d)
+        # smooth_grad = jax.grad(smooth_loss_fn)(bc_3d)
+        #
+        # motion_penalty = jnp.sum(thetas ** 2) * lambda_motion
+        #
+        # total_grad = data_grad + lambda_bc * smooth_grad
+        #
+        # total_loss = data_term + lambda_bc * smooth_term
+        #
+        #
+        # updates, opt_state = opt.update(total_grad, opt_state, params=bc_3d)
+        #
+        # bc_3d = optax.apply_updates(bc_3d, updates)
 
-        # lap = laplacian_3d(bc_3d)
-        smooth_term = smooth_loss_fn(bc_3d)
-        smooth_grad = jax.grad(smooth_loss_fn)(bc_3d)
+        (loss_value, (data_term, smooth_term, motion_term, recon)), grads = \
+            jax.value_and_grad(loss_fn, has_aux=True)(params,
+                                                      xp_base, dwi_images,
+                                                      omega_3d,
+                                                      target_res_tuple,
+                                                      m_distorted_tuple, data,
+                                                      weight_bc=lambda_bc,
+                                                      weight_motion=lambda_motion)
 
-        total_grad = data_grad + lambda_bc * smooth_grad
+        updates, opt_state = opt.update(grads, opt_state, params)
+        params = optax.apply_updates(params, updates)
 
-        total_loss = data_term + lambda_bc * smooth_term
+        # (loss_val, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(
+        #     params, xp_base, dwi_images, omega_3d,
+        #     target_res_tuple, m_distorted_tuple, data,
+        #     weight_bc=10.0, weight_motion=1.0)
 
-        updates, opt_state = opt.update(total_grad, opt_state, params=bc_3d)
+        # updates, opt_state = tx.update(grads, opt_state, params)
+        # params = optax.apply_updates(params, updates)
+        #
+        # print(f"Step {step}: loss={loss_val:.4e}  "
+        #       f"data={aux[0]:.4e}  smooth={aux[1]:.4e}  "
+        #       f"motion={aux[2]:.4e}")
 
-        bc_3d = optax.apply_updates(bc_3d, updates)
+        print(f"Step {step}: loss={loss_value:.4e}  "
+              f"data={data_term:.4e}  smooth={smooth_term:.4e}  "
+              f"motion={motion_term:.4e}")
 
-        print(f"{step}: loss = {total_loss:.4e}")
+        # print(f"{step}: loss = {total_loss:.4e}")
 
         save_jax_data(recon.reshape(*target_res).transpose(3, 2, 1, 0),
-                      f"/home/laurin/workspace/PyHySCO/data/results/debug/recon_{step}.nii.gz")
-        save_jax_data(total_grad.transpose(3, 2, 1, 0),
-                      f"/home/laurin/workspace/PyHySCO/data/results/debug/grad_{step}.nii.gz")
-        save_jax_data(bc_3d.transpose(3, 2, 1, 0),
-                      f"/home/laurin/workspace/PyHySCO/data/results/debug/bc_3d_{step}.nii.gz")
-        save_jax_data(smooth_grad.transpose(3, 2, 1, 0),
-                      f"/home/laurin/workspace/PyHySCO/data/results/debug/grad_smooth_{step}.nii.gz")
-        save_jax_data(data_grad.transpose(3, 2, 1, 0),
-                      f"/home/laurin/workspace/PyHySCO/data/results/debug/grad_data_{step}.nii.gz")
+                      f"/home/laurin/workspace/PyHySCO/data/results/debug/recon_moco_first_{step}.nii.gz")
+        # save_jax_data(total_grad.transpose(3, 2, 1, 0),
+        #               f"/home/laurin/workspace/PyHySCO/data/results/debug/grad_{step}.nii.gz")
+        # save_jax_data(bc_3d.transpose(3, 2, 1, 0),
+        #               f"/home/laurin/workspace/PyHySCO/data/results/debug/bc_3d_{step}.nii.gz")
+        # save_jax_data(smooth_grad.transpose(3, 2, 1, 0),
+        #               f"/home/laurin/workspace/PyHySCO/data/results/debug/grad_smooth_{step}.nii.gz")
+        # save_jax_data(data_grad.transpose(3, 2, 1, 0),
+        #               f"/home/laurin/workspace/PyHySCO/data/results/debug/grad_data_{step}.nii.gz")
 
-
+        jax.profiler.stop_trace()
