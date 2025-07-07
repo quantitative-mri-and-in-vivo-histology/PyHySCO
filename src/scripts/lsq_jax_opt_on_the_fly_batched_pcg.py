@@ -62,6 +62,52 @@ from particle_in_cell_utils import *
 from scripts.lsq_jax_motion_per_pe import batch_solve
 
 
+import jax
+import jax.numpy as jnp
+from jax import lax
+from functools import partial
+
+
+# ------------------------------------------------------------
+#  0.  Put your batched PCG somewhere above solve()
+# ------------------------------------------------------------
+def pcg_batched(Ax, b, M_inv, x0, tol=1e-6, maxiter=50):
+    """Batched pre-conditioned CG (see previous message)."""
+    def dot(u, v): return jnp.sum(u * v, axis=-1)
+
+    r0 = b - Ax(x0)
+    z0 = M_inv(r0)
+    p0 = z0
+    rz0 = dot(r0, z0)
+    state0 = (0, x0, r0, z0, p0, rz0)
+
+    def body(s):
+        k, x, r, z, p, rz = s
+        Ap   = Ax(p)
+        alpha = rz / dot(p, Ap)             ; alpha = alpha[:, None]
+        x, r  = x + alpha*p, r - alpha*Ap
+        z     = M_inv(r)
+        rz_new= dot(r, z)
+        beta  = rz_new / rz                 ; beta  = beta[:, None]
+        p     = z + beta*p
+        return (k+1, x, r, z, p, rz_new)
+
+    def cond(s):
+        k, _, r, *_ = s
+        return jnp.logical_and(k < maxiter,
+                               jnp.max(jnp.linalg.norm(r, axis=-1)) > tol)
+
+    _, x_final, *_ = lax.while_loop(cond, body, state0)
+    return x_final
+
+
+def _chunk_indices(n_items, chunk):
+    n_chunks = (n_items + chunk - 1) // chunk  # ceil div
+    counts = jnp.minimum(chunk,
+                         n_items - jnp.arange(n_chunks) * chunk)
+    # e.g. n_items=10, chunk=4  →  counts=[4,4,2]
+    return jnp.repeat(jnp.arange(n_chunks), counts)  # (n_items,)
+
 def pose_to_matrix(theta_row):
     t = theta_row[:3]
     rx, ry, rz = theta_row[3:]
@@ -158,37 +204,71 @@ class DwiOptimizer:
         self.stencil_build_fn = make_stencil_builder(self.omega, self.m_cell, self.m_part)
 
 
+
+    # ---------------------------------------------------------------------
+    # main solver
+    # ---------------------------------------------------------------------
     def solve(self, vol_obs: jnp.ndarray,
-              distortion_model):
-        """
-        Runs ATAx-based PIC-LSQ for each volume (via lax.map).
-        """
-        n_vols = vol_obs.shape[1]
-        M_inv = lambda r: r
+              distortion_model,
+              batch_size = 5):
+        ...
+        if batch_size is None or batch_size >= n_vols:
+            rho_batch, loss_batch = solve_chunk_jit(jnp.arange(n_vols))
+        else:
+            chunk_tags = _chunk_indices(n_vols, batch_size)  # (n_vols,)
+            n_chunks = int(chunk_tags[-1]) + 1
 
-        def solve_one(vol_index):
-            rho_init = jnp.zeros(
-                self.m_part[0] * self.m_part[1] * self.m_part[2])
+            def body(tag):
+                mask = (chunk_tags == tag)  # bool mask
+                all_ids = jnp.arange(n_vols)
+                vol_ids = jnp.where(mask, all_ids, -1)  # pad with -1
+                vol_ids = vol_ids[vol_ids >= 0]  # 🚫 ❌ NOT ALLOWED in JAX
 
-            y = vol_obs[:, vol_index].reshape(vol_obs.shape[0], -1)
-            rhs = self.ATy(y, vol_index, distortion_model)
-            # ATAx_fn = lambda x: self.ATAx(x, vol_index, 8,
-            #                               self.lambda_smooth, distortion_model)
-            ATAx_fn = partial(self.ATAx,
-                              vol_index=vol_index,
-                              n_obs=8,
-                              lambda_smooth=self.lambda_smooth,
-                              distortion_model=distortion_model)
-            rho_est, _ = jax.scipy.sparse.linalg.cg(ATAx_fn, rhs, M=M_inv, x0=rho_init,
-                                                    tol=1e-5, maxiter=10)
-            loss = jnp.sum((ATAx_fn(rho_est) - rhs) ** 2)
-            return rho_est, loss
+                # instead, make this:
+                indices = jnp.where(mask)[0]  # all valid indices
+                padded = jnp.full((batch_size,), -1)
+                padded = padded.at[:indices.shape[0]].set(indices)
+                valid_count = indices.shape[0]
 
-        rho_all, loss_all = lax.map(solve_one, jnp.arange(n_vols), batch_size=1)
-        # rho_all, loss_all = lax.map(solve_one, jnp.arange(5),
-        #                             batch_size=5)
-        total_loss = jnp.sum(loss_all)
-        return rho_all, total_loss
+                # solve_chunk_jit expects a (≤B,) array of indices
+                rho, loss = solve_chunk_jit(padded[:valid_count])
+                return rho, loss
+
+            rho_list, loss_list = lax.map(body, jnp.arange(n_chunks))
+            rho_batch = jnp.concatenate(rho_list, axis=0)
+            loss_batch = jnp.concatenate(loss_list, axis=0)
+
+    # def solve(self, vol_obs: jnp.ndarray,
+    #           distortion_model):
+    #     """
+    #     Runs ATAx-based PIC-LSQ for each volume (via lax.map).
+    #     """
+    #     n_vols = vol_obs.shape[1]
+    #     M_inv = lambda r: r
+    #
+    #     def solve_one(vol_index):
+    #         rho_init = jnp.zeros(
+    #             self.m_part[0] * self.m_part[1] * self.m_part[2])
+    #
+    #         y = vol_obs[:, vol_index].reshape(vol_obs.shape[0], -1)
+    #         rhs = self.ATy(y, vol_index, distortion_model)
+    #         # ATAx_fn = lambda x: self.ATAx(x, vol_index, 8,
+    #         #                               self.lambda_smooth, distortion_model)
+    #         ATAx_fn = partial(self.ATAx,
+    #                           vol_index=vol_index,
+    #                           n_obs=8,
+    #                           lambda_smooth=self.lambda_smooth,
+    #                           distortion_model=distortion_model)
+    #         rho_est, _ = jax.scipy.sparse.linalg.cg(ATAx_fn, rhs, M=M_inv, x0=rho_init,
+    #                                                 tol=1e-5, maxiter=10)
+    #         loss = jnp.sum((ATAx_fn(rho_est) - rhs) ** 2)
+    #         return rho_est, loss
+    #
+    #     rho_all, loss_all = lax.map(solve_one, jnp.arange(n_vols), batch_size=1)
+    #     # rho_all, loss_all = lax.map(solve_one, jnp.arange(5),
+    #     #                             batch_size=5)
+    #     total_loss = jnp.sum(loss_all)
+    #     return rho_all, total_loss
 
     @partial(jax.jit, static_argnums=(0,3))
     def ATy(self,

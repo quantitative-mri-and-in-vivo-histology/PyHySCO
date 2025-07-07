@@ -164,21 +164,27 @@ class DwiOptimizer:
         Runs ATAx-based PIC-LSQ for each volume (via lax.map).
         """
         n_vols = vol_obs.shape[1]
+        n_obs = vol_obs.shape[0]
         M_inv = lambda r: r
 
         def solve_one(vol_index):
+            xp_all = jax.vmap(distortion_model.apply, in_axes=(None, 0, None))(
+                # (n_obs, 3, Np)
+                self.xp_base, jnp.arange(n_obs), vol_index)
+
+            idx, weights = jax.vmap(self.stencil_build_fn)(xp_all)
+
             rho_init = jnp.zeros(
                 self.m_part[0] * self.m_part[1] * self.m_part[2])
 
             y = vol_obs[:, vol_index].reshape(vol_obs.shape[0], -1)
-            rhs = self.ATy(y, vol_index, distortion_model)
+            rhs = self.ATy(y, idx, weights)
             # ATAx_fn = lambda x: self.ATAx(x, vol_index, 8,
             #                               self.lambda_smooth, distortion_model)
             ATAx_fn = partial(self.ATAx,
-                              vol_index=vol_index,
-                              n_obs=8,
-                              lambda_smooth=self.lambda_smooth,
-                              distortion_model=distortion_model)
+                              idx=idx,
+                              weights=weights,
+                              lambda_smooth=self.lambda_smooth)
             rho_est, _ = jax.scipy.sparse.linalg.cg(ATAx_fn, rhs, M=M_inv, x0=rho_init,
                                                     tol=1e-5, maxiter=10)
             loss = jnp.sum((ATAx_fn(rho_est) - rhs) ** 2)
@@ -190,56 +196,76 @@ class DwiOptimizer:
         total_loss = jnp.sum(loss_all)
         return rho_all, total_loss
 
-    @partial(jax.jit, static_argnums=(0,3))
+    @partial(jax.jit, static_argnums=(0))
     def ATy(self,
             y: jnp.ndarray,  # shape (n_obs, n_cells)
-            vol_index: int,
-            distortion_model) -> jnp.ndarray:
+            idx,
+            weights) -> jnp.ndarray:
         """Compute RHS rhs = (1/n_obs) Σ_k T_kᵀ y_k  in JAX-friendly form."""
 
         n_obs = y.shape[0]  # traced as a constant inside jit
 
         def body(k, acc):
-            # --- 1. particle coords for this observation ------------------------
-            xp = distortion_model.apply(self.xp_base, k, vol_index)  # (3, Np)
-
-            # --- 2. build 27-point PIC stencil ----------------------------------
-            idx, w = self.stencil_build_fn(xp)
-
             # --- 3. apply adjoint ----------------------------------------------
-            acc = acc + pic_adjoint(y[k], idx, w)
+            acc = acc + pic_adjoint(y[k], idx[k], weights[k])
             return acc
 
         rhs = lax.fori_loop(0, n_obs, body,
                             jnp.zeros(self.n_particles, dtype=y.dtype))
         return rhs / n_obs
 
-    @partial(jax.jit, static_argnums=(0,3,4,5))
-    def ATAx(self, x, vol_index, n_obs, lambda_smooth, distortion_model):
+    # @partial(jax.jit, static_argnums=(0,4,5))
+    # def ATAx(self, x, idx, weights, n_obs, lambda_smooth):
+    #     """
+    #     Compute AᵀA x = (1/n_obs) Σ_k T_kᵀ T_k x + λ Δ x
+    #     using vmap over observations.
+    #     """
+    #
+    #     # 1. Vectorized inner function (over k)
+    #     def single_TtT():
+    #         y = pic_forward(x, idx, weights, self.n_cells)
+    #         yt = pic_adjoint(y, idx, weights)
+    #         return yt
+    #
+    #     # 2. vmap over all obs
+    #     TtT_all = jax.vmap(single_TtT)
+    #     TtT = jnp.mean(TtT_all, axis=0)
+    #
+    #     # 3. Add Laplacian regularization
+    #     if lambda_smooth > 0:
+    #         lap_term = tikhonov_like_3d_full(x, self.m_part)
+    #         TtT += lambda_smooth * lap_term
+    #
+    #     return TtT
+
+    @partial(jax.jit, static_argnums=(0,4))
+    def ATAx(self, x, idx, weights, lambda_smooth):
         """
-        Compute AᵀA x = (1/n_obs) Σ_k T_kᵀ T_k x + λ Δ x
-        using vmap over observations.
+        AᵀA x = (1/n_obs) Σ_k T_kᵀ T_k x + λ Δx
+        Idx/weights are batched over k  →  shape (n_obs, N_particles, S)
         """
 
-        # 1. Vectorized inner function (over k)
-        def single_TtT(k):
-            xp = distortion_model.apply(self.xp_base, k, vol_index)
-            idx, w = self.stencil_build_fn(xp)
-            y = pic_forward(x, idx, w, self.n_cells)
-            yt = pic_adjoint(y, idx, w)
+        # ------------------------------------------------------------------
+        # 1. single observation:  T_kᵀ T_k x
+        # ------------------------------------------------------------------
+        def single_TtT(idx_k, w_k):
+            y  = pic_forward(x, idx_k, w_k, self.n_cells)   # → (N_cells,)
+            yt = pic_adjoint(y, idx_k, w_k)                 # → (N_particles,)
             return yt
 
-        # 2. vmap over all obs
-        TtT_all = jax.vmap(single_TtT)(jnp.arange(n_obs))
-        TtT = jnp.mean(TtT_all, axis=0)
+        # ------------------------------------------------------------------
+        # 2. vmap over all observations
+        # ------------------------------------------------------------------
+        TtT_all = jax.vmap(single_TtT)(idx, weights)        # (n_obs, N_particles)
+        TtT     = jnp.mean(TtT_all, axis=0)                 # (N_particles,)
 
-        # 3. Add Laplacian regularization
+        # ------------------------------------------------------------------
+        # 3. Laplacian regulariser
+        # ------------------------------------------------------------------
         if lambda_smooth > 0:
-            lap_term = tikhonov_like_3d_full(x, self.m_part)
-            TtT += lambda_smooth * lap_term
+            TtT += lambda_smooth * tikhonov_like_3d_full(x, self.m_part)
 
         return TtT
-
 
 def save_jax_data(data, filepath, affine=None):
     """
@@ -274,38 +300,6 @@ def pic_forward(rho, idx, w, n_cells):
     idx_flat = idx.reshape(-1)               # (N*S,)
     return jax.ops.segment_sum(val, idx_flat, n_cells)
 
-
-def pic_normal_matvec(rho: jnp.ndarray,
-                          xp_base: jnp.ndarray,
-                          omega: jnp.ndarray,
-                          m_recon: jnp.ndarray,
-                          m_distorted: jnp.ndarray,
-                          n_cells: int,
-                          lambda_s: float):
-    """Matrix–vector product  A rho  with
-           A = Σ_k T_kᵀ T_k / n_obs  +  λ_s ∇ᵀ∇  (here laplace)"""
-
-    def single_TtT(x, idx, w):
-        y = pic_forward(x, idx, w, n_cells)  # (N,)
-        yt = pic_adjoint(y, idx, w)  # (n_cells,)
-        return yt
-
-
-    def scan_body(carry, args):
-        xp = args
-        idx, w = build_pic_stencils_3d(omega, m_distorted, m_recon, xp)
-        out = single_TtT(rho, idx, w)
-        return carry + out, None
-
-    TtT_sum, _ = jax.lax.scan(scan_body, jnp.zeros_like(rho),
-                              (xp_base))
-    TtT = TtT_sum / xp_base.shape[0]
-
-    if lambda_s > 0:
-        lap_term = tikhonov_like_3d_full(rho, m_recon)
-        TtT += lambda_s * lap_term
-
-    return TtT
 
 
 ################################################################################
