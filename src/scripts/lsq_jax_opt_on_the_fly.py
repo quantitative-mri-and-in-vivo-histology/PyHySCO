@@ -32,7 +32,8 @@ from sympy.physics.vector import outer
 # os.environ["JAX_PLATFORM_NAME"] = "cpu"
 # os.environ["XLA_FLAGS"] = "--xla_gpu_enable_tracing=true"
 
-
+# os.environ["XLA_FLAGS"] = "--xla_cpu_enable_fast_math=false --xla_gpu_autotune_level=3"
+# os.environ["XLA_FLAGS"] = " --xla_disable_hlo_fusion=true"
 
 import gc
 
@@ -41,9 +42,10 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 import jax.profiler
+from jax.profiler import annotate_function
 from jax.experimental import sparse
 from jax.scipy.sparse.linalg import cg
-from jax.scipy.optimize import minimize
+# from jax.scipy.optimize import minimizes
 import os
 import time
 import optax
@@ -60,6 +62,115 @@ import nibabel as nib
 from typing import NamedTuple
 from particle_in_cell_utils import *
 from scripts.lsq_jax_motion_per_pe import batch_solve
+
+
+# @partial(jax.jit, static_argnums=0)
+# def build_cell_lists(xp,              # (3, N_particles) particle coords
+#                      m_cell):         # (Dz, Dy, Dx)
+#     """Return (cell_particles, part_cells) for a whole volume."""
+#     Nz, Ny, Nx = m_cell
+#     N_cells = Nz * Ny * Nx
+#
+#     # cell index for every particle
+#     cz = (xp[0] // cell_sz[0]).astype(jnp.int32)
+#     cy = (xp[1] // cell_sz[1]).astype(jnp.int32)
+#     cx = (xp[2] // cell_sz[2]).astype(jnp.int32)
+#     lin = (cz * Ny + cy) * Nx + cx            # (N_particles,)
+#
+#     # part_cells keeps (cz,cy,cx) for each particle
+#     part_cells = jnp.stack([cz, cy, cx], axis=1)
+#
+#     # build cell_particles via segment-scatter
+#     order = jnp.argsort(lin)                  # stable
+#     lin_sorted = lin[order]
+#     pid_sorted = order
+#
+#     # slots 0..MAX_PER_CELL-1 inside each cell
+#     slot = jnp.cumsum(jnp.ones_like(lin_sorted)) - 1
+#     slot = slot - jax.ops.segment_sum(slot, lin_sorted, N_cells)
+#
+#     # initialise with −1
+#     cell_particles = -jnp.ones((N_cells, MAX_PER_CELL), dtype=jnp.int32)
+#     cell_particles = cell_particles.at[lin_sorted, slot].set(pid_sorted)
+#
+#     return cell_particles, part_cells
+#
+#
+#
+# # ---------------------------------------------------------
+# # Map: cell index -> list of particles inside each cell
+# # ---------------------------------------------------------
+# def particles_per_cell(cell_idx, n_cells, max_per_cell=128):
+#     """Returns a (n_cells, max_per_cell) matrix with particle IDs."""
+#     N = cell_idx.shape[0]
+#     counts = jnp.zeros(n_cells, dtype=jnp.int32)
+#     cell_particles = -jnp.ones((n_cells, max_per_cell), dtype=jnp.int32)
+#
+#     def body_fun(i, state):
+#         counts, table = state
+#         c = cell_idx[i]
+#         idx = counts[c]
+#         table = table.at[c, idx].set(i)
+#         counts = counts.at[c].add(1)
+#         return counts, table
+#
+#     _, table = jax.lax.fori_loop(0, N, body_fun, (counts, cell_particles))
+#     return table  # shape (n_cells, max_per_cell)
+#
+#
+# # ----------------------------------------------------------------
+# # Get neighbor particle indices of particle p_idx using cell list
+# # ----------------------------------------------------------------
+# def neighbours_of(p_idx, cell_particles, part_cells, m_cell, pwidth=1):
+#     """Returns particle indices in neighboring cells (flattened)."""
+#     cell = part_cells[p_idx]
+#
+#     # Decode linear index back to 3D cell coords
+#     cz = cell // (m_cell[1] * m_cell[2])
+#     cy = (cell % (m_cell[1] * m_cell[2])) // m_cell[2]
+#     cx = cell % m_cell[2]
+#
+#     offsets = jnp.array([
+#         (dz, dy, dx)
+#         for dz in range(-pwidth, pwidth + 1)
+#         for dy in range(-pwidth, pwidth + 1)
+#         for dx in range(-pwidth, pwidth + 1)
+#     ])  # shape (M, 3)
+#
+# MAX_NBR = 27 * offsets.shape[0]  # e.g. 27·max_per_cell
+#
+# def neighbours_of(pid,
+#                   cell_particles,
+#                   part_cells,
+#                   offsets,
+#                   m_cell):
+#     """Return (nbr_ids, mask) both fixed‒shape (MAX_NBR,)."""
+#
+#     cz, cy, cx = part_cells[pid]  # that particle’s cell
+#
+#     def get_neighbors(offset):
+#         dz, dy, dx = offset  # each a scalar
+#         nz, ny, nx = cz + dz, cy + dy, cx + dx
+#         valid_cell = (0 <= nz) & (nz < m_cell[0]) & \
+#                      (0 <= ny) & (ny < m_cell[1]) & \
+#                      (0 <= nx) & (nx < m_cell[2])
+#         ncell = (nz * m_cell[1] + ny) * m_cell[2] + nx
+#         # pick all particles in that cell or −1 if cell is invalid
+#         return jnp.where(valid_cell, cell_particles[ncell], -1)
+#
+#     # (n_offsets, max_per_cell)
+#     nbr_block = jax.vmap(get_neighbors)(offsets)
+#
+#     # collapse to flat (MAX_NBR,)
+#     nbr_ids = nbr_block.reshape(-1)
+#
+#     # build a concrete boolean mask
+#     mask = nbr_ids >= 0
+#
+#     # keep sentinel −1 in nbr_ids; NEVER slice with the mask
+#     nbr_ids = jnp.where(mask, nbr_ids, 0)  # 0 won’t be used when masked
+#
+#     return nbr_ids, mask  # both length MAX_NBR
 
 
 def pose_to_matrix(theta_row):
@@ -157,32 +268,32 @@ class DwiOptimizer:
         self.lambda_smooth = 0.1
         self.stencil_build_fn = make_stencil_builder(self.omega, self.m_cell, self.m_part)
 
-
+    @partial(jax.jit, static_argnums=(0,2))
     def solve(self, vol_obs: jnp.ndarray,
               distortion_model):
         """
         Runs ATAx-based PIC-LSQ for each volume (via lax.map).
         """
         n_vols = vol_obs.shape[1]
+        n_obs = vol_obs.shape[0]
         M_inv = lambda r: r
 
         def solve_one(vol_index):
-            rho_init = jnp.zeros(
-                self.m_part[0] * self.m_part[1] * self.m_part[2])
+            with jax.profiler.TraceAnnotation("solve_one"):
+                rho_init = jnp.zeros(
+                    self.m_part[0] * self.m_part[1] * self.m_part[2])
 
-            y = vol_obs[:, vol_index].reshape(vol_obs.shape[0], -1)
-            rhs = self.ATy(y, vol_index, distortion_model)
-            # ATAx_fn = lambda x: self.ATAx(x, vol_index, 8,
-            #                               self.lambda_smooth, distortion_model)
-            ATAx_fn = partial(self.ATAx,
-                              vol_index=vol_index,
-                              n_obs=8,
-                              lambda_smooth=self.lambda_smooth,
-                              distortion_model=distortion_model)
-            rho_est, _ = jax.scipy.sparse.linalg.cg(ATAx_fn, rhs, M=M_inv, x0=rho_init,
-                                                    tol=1e-5, maxiter=10)
-            loss = jnp.sum((ATAx_fn(rho_est) - rhs) ** 2)
-            return rho_est, loss
+                y = vol_obs[:, vol_index].reshape(vol_obs.shape[0], -1)
+                rhs = self.ATy(y, vol_index, distortion_model)
+                ATAx_fn = partial(self.ATAx,
+                                  vol_index=vol_index,
+                                  n_obs=n_obs,
+                                  lambda_smooth=self.lambda_smooth,
+                                  distortion_model=distortion_model)
+                rho_est, _ = jax.scipy.sparse.linalg.cg(ATAx_fn, rhs, M=M_inv, x0=rho_init,
+                                                        tol=1e-5, maxiter=10)
+                loss = jnp.sum((ATAx_fn(rho_est) - rhs) ** 2)
+                return rho_est, loss
 
         rho_all, loss_all = lax.map(solve_one, jnp.arange(n_vols), batch_size=1)
         # rho_all, loss_all = lax.map(solve_one, jnp.arange(5),
@@ -214,31 +325,116 @@ class DwiOptimizer:
                             jnp.zeros(self.n_particles, dtype=y.dtype))
         return rhs / n_obs
 
-    @partial(jax.jit, static_argnums=(0,3,4,5))
+    # --------------------------------------------
+    # Example of ATAx using cell list neighbor ops
+    # --------------------------------------------
+    @partial(jax.jit, static_argnums=(0, 3, 4, 5))
     def ATAx(self, x, vol_index, n_obs, lambda_smooth, distortion_model):
-        """
-        Compute AᵀA x = (1/n_obs) Σ_k T_kᵀ T_k x + λ Δ x
-        using vmap over observations.
-        """
+        """Simplified ATAx using neighbor list logic."""
 
-        # 1. Vectorized inner function (over k)
         def single_TtT(k):
-            xp = distortion_model.apply(self.xp_base, k, vol_index)
-            idx, w = self.stencil_build_fn(xp)
-            y = pic_forward(x, idx, w, self.n_cells)
-            yt = pic_adjoint(y, idx, w)
-            return yt
+            xp = distortion_model.apply(self.xp_base, k, vol_index)  # (3, N)
+            cell_idx = build_cell_list(xp, self.m_cell, self.omega)
+            cell_particles = particles_per_cell(cell_idx, self.n_cells)
 
-        # 2. vmap over all obs
+            def per_particle(pid):
+                nbr_ids, mask = neighbours_of(pid,
+                                              cell_particles,
+                                              part_cells,
+                                              offsets,
+                                              m_cell)
+
+                # gather particle values once
+                rho_nbr = x[nbr_ids]  # fixed shape (MAX_NBR,)
+
+                # weight: here 1.0, replace by kernel(r)
+                w = jnp.ones_like(rho_nbr)
+
+                # mask out invalid neighbours
+                contrib = jnp.where(mask, rho_nbr * w, 0.0)
+
+                return contrib.sum()
+
+            return jax.vmap(per_particle)(jnp.arange(self.n_particles))
+
         TtT_all = jax.vmap(single_TtT)(jnp.arange(n_obs))
         TtT = jnp.mean(TtT_all, axis=0)
 
-        # 3. Add Laplacian regularization
-        if lambda_smooth > 0:
-            lap_term = tikhonov_like_3d_full(x, self.m_part)
-            TtT += lambda_smooth * lap_term
+        if lambda_smooth > 0.0:
+            TtT += lambda_smooth * tikhonov_like_3d_full(x, self.m_part)
 
         return TtT
+
+    # # ------------------------------------------------------------------
+    # #  v-mapped ATAx  (one lane = one observation)
+    # # ------------------------------------------------------------------
+    # @partial(jax.jit, static_argnums=(0, 3, 4, 5))
+    # def ATAx(self, x, vol_index, n_obs, lambda_smooth, distortion_model):
+    #     """
+    #     Vectorised over observations with jax.vmap.
+    #     Computes:  (1 / n_obs) Σ_k  T_kᵀ T_k x  +  λ Δx
+    #     Faster than the scan version when memory allows.
+    #     """
+    #
+    #     # --------------------------------------------------------------
+    #     # 1.  Build stencils for *all* observations in one vmap pass
+    #     # --------------------------------------------------------------
+    #     def build_stencil(k):
+    #         xp = distortion_model.apply(self.xp_base, k, vol_index)
+    #         return self.stencil_build_fn(xp)  # → (N,S) idx, (N,S) w
+    #
+    #     idx_all, w_all = jax.vmap(build_stencil)(jnp.arange(n_obs))
+    #
+    #     # shapes:  idx_all (n_obs, N, S),  w_all (n_obs, N, S)
+    #
+    #     # --------------------------------------------------------------
+    #     # 2.  Per-observation Tᵀ T x  (one lane)
+    #     # --------------------------------------------------------------
+    #     def single_ttT(idx, w):
+    #         # forward ρ → y  (particles ➜ cells)
+    #         val = (x[:, None] * w).reshape(-1)  # (N*S,)
+    #         idx_flat = idx.reshape(-1)
+    #         y_cells = lax.scatter_add(
+    #             jnp.zeros(self.n_cells, x.dtype),
+    #             idx_flat[:, None],
+    #             val,
+    #             dimension_numbers=lax.ScatterDimensionNumbers(
+    #                 update_window_dims=(),
+    #                 inserted_window_dims=(0,),
+    #                 scatter_dims_to_operand_dims=(0,)
+    #             )
+    #         )
+    #
+    #         # adjoint   y → ρ  (cells ➜ particles)
+    #         gathered = y_cells[idx_flat]
+    #         contrib = gathered * w.reshape(-1)
+    #         part_idx = jnp.repeat(jnp.arange(self.n_particles), w.shape[1])
+    #         yt = lax.scatter_add(
+    #             jnp.zeros_like(x),
+    #             part_idx[:, None],
+    #             contrib,
+    #             dimension_numbers=lax.ScatterDimensionNumbers(
+    #                 update_window_dims=(),
+    #                 inserted_window_dims=(0,),
+    #                 scatter_dims_to_operand_dims=(0,)
+    #             )
+    #         )
+    #         return yt  # (N_particles,)
+    #
+    #     # jax.lax.select_and_gather_add_p
+    #     # --------------------------------------------------------------
+    #     # 3.  Batch the kernel over k with vmap
+    #     # --------------------------------------------------------------
+    #     TtT_all = jax.vmap(single_ttT)(idx_all, w_all)  # (n_obs, N)
+    #     TtT = jnp.mean(TtT_all, axis=0)  # average over obs
+    #
+    #     # --------------------------------------------------------------
+    #     # 4.  Smoothness term
+    #     # --------------------------------------------------------------
+    #     if lambda_smooth > 0.0:
+    #         TtT += lambda_smooth * tikhonov_like_3d_full(x, self.m_part)
+    #
+    #     return TtT
 
 
 def save_jax_data(data, filepath, affine=None):
@@ -353,7 +549,22 @@ def tikhonov_like_3d_full(r, spatial_size):
 
 
 
-
+def laplacian_conv(x, spatial):
+    D,H,W = spatial
+    K = jnp.array([[[0,0,0],
+                    [0,1,0],
+                    [0,0,0]],
+                   [[0,1,0],
+                    [1,-6,1],
+                    [0,1,0]],
+                   [[0,0,0],
+                    [0,1,0],
+                    [0,0,0]]], x.dtype)
+    return lax.conv_general_dilated(
+            x.reshape(1,1,D,H,W),
+            K.reshape(1,1,3,3,3),
+            window_strides=(1,1,1),
+            padding="SAME")[0,0].reshape(-1)
 
 
 
@@ -401,18 +612,18 @@ if __name__ == "__main__":
     import numpy as np
 
     timestamp = time.strftime("%Y-%m-%d_%H-%M-%S")
-    # logdir = f"/home/laurin/workspace/PyHySCO/data/results/debug/tensor_logs/{timestamp}"
-    # os.makedirs(logdir, exist_ok=True)
-    # jax.profiler.start_trace(logdir)
+    logdir = f"/home/laurin/workspace/PyHySCO/data/results/debug/tensor_logs/{timestamp}"
+    os.makedirs(logdir, exist_ok=True)
+    jax.profiler.start_trace(logdir)
     # start_time = time.time()
 
-    image_config_file = "/home/laurin/workspace/PyHySCO/data/raw/lowres/image_config.json"
+    image_config_file = "/home/laurin/workspace/PyHySCO/data/raw/highres/image_config.json"
     device =  'cpu'
     pair_idx = [0,1,2,3]
     # pair_idx = 0
     data = MultiPeDtiData(image_config_file, device=device, dtype=torch.float32, pair_idx=pair_idx)
 
-    target_res = [*data.m[:-2], 66, 66]
+    target_res = [*data.m[:-2], 128, 128]
     target_res = torch.tensor(target_res, dtype=torch.int32, device=device)
     initialization = InitializeCFMultiePeDtiDataResampled()
     B0 = initialization.eval(data, target_res, blur_result=True)
@@ -505,3 +716,9 @@ if __name__ == "__main__":
 
     save_jax_data(recon.reshape(*target_res).transpose(3, 2, 1, 0),
                   f"/home/laurin/workspace/PyHySCO/data/results/debug/recon.nii.gz")
+
+    # Wait briefly to ensure all ops complete
+    jax.block_until_ready(recon)
+
+    # Stop trace recording
+    jax.profiler.stop_trace()

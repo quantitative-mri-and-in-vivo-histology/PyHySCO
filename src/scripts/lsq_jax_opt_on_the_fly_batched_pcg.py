@@ -71,42 +71,58 @@ from functools import partial
 # ------------------------------------------------------------
 #  0.  Put your batched PCG somewhere above solve()
 # ------------------------------------------------------------
-def pcg_batched(Ax, b, M_inv, x0, tol=1e-6, maxiter=50):
-    """Batched pre-conditioned CG (see previous message)."""
-    def dot(u, v): return jnp.sum(u * v, axis=-1)
+def pcg_batched(Ax, b, M_inv, x0, *, tol=1e-6, maxiter=50):
+    """
+    Pre-conditioned CG with a leading batch dimension.
 
-    r0 = b - Ax(x0)
-    z0 = M_inv(r0)
+    Parameters
+    ----------
+    Ax  : callable (B,N) → (B,N)
+          batched linear operator (e.g. AᵀA for each volume)
+    b   : (B,N)  right-hand sides
+    M_inv : callable (B,N) → (B,N)  (Jacobi → identity is fine)
+    x0  : (B,N)  initial guesses
+    tol, maxiter : CG stop criteria (batch-wise max‐norm)
+
+    Returns
+    -------
+    x   : (B,N)  solution batch
+    """
+
+    def dot(u, v):                     # (B,N)·(B,N) → (B,)
+        return jnp.sum(u * v, axis=-1)
+
+    r0 = b - Ax(x0)                    # (B,N)
+    z0 = M_inv(r0)                     # (B,N)
     p0 = z0
-    rz0 = dot(r0, z0)
-    state0 = (0, x0, r0, z0, p0, rz0)
+    rz0 = dot(r0, z0)                  # (B,)
+
+    state0 = (0, x0, r0, z0, p0, rz0)  # k, x, r, z, p, rz
 
     def body(s):
         k, x, r, z, p, rz = s
-        Ap   = Ax(p)
-        alpha = rz / dot(p, Ap)             ; alpha = alpha[:, None]
-        x, r  = x + alpha*p, r - alpha*Ap
-        z     = M_inv(r)
-        rz_new= dot(r, z)
-        beta  = rz_new / rz                 ; beta  = beta[:, None]
-        p     = z + beta*p
-        return (k+1, x, r, z, p, rz_new)
+
+        Ap = Ax(p)                     # (B,N)
+        alpha = rz / dot(p, Ap)        # (B,)
+        alpha = alpha[:, None]         # (B,1) for broadcasting
+
+        x   = x + alpha * p
+        r   = r - alpha * Ap
+        z   = M_inv(r)
+        rz_new = dot(r, z)             # (B,)
+
+        beta  = (rz_new / rz)[:, None]
+        p     = z + beta * p
+
+        return (k + 1, x, r, z, p, rz_new)
 
     def cond(s):
-        k, _, r, *_ = s
+        k, _x, r, *_ = s
         return jnp.logical_and(k < maxiter,
                                jnp.max(jnp.linalg.norm(r, axis=-1)) > tol)
 
     _, x_final, *_ = lax.while_loop(cond, body, state0)
     return x_final
-
-
-def _chunk_indices(n_items, chunk):
-    n_chunks = (n_items + chunk - 1) // chunk  # ceil div
-    counts = jnp.minimum(chunk,
-                         n_items - jnp.arange(n_chunks) * chunk)
-    # e.g. n_items=10, chunk=4  →  counts=[4,4,2]
-    return jnp.repeat(jnp.arange(n_chunks), counts)  # (n_items,)
 
 def pose_to_matrix(theta_row):
     t = theta_row[:3]
@@ -206,52 +222,37 @@ class DwiOptimizer:
 
 
     # ---------------------------------------------------------------------
-    # main solver
-    # ---------------------------------------------------------------------
-    # ---------------------------------------------------------------------
-    #  batched PCG helper (same as before)
-    # ---------------------------------------------------------------------
-    def pcg_batched(Ax, b, M_inv, x0, tol=1e-6, maxiter=50):
-        # one-line wrapper that vmaps the scalar pcg over batch dim
-        single = lambda Ax_i, b_i, x0_i: pcg(Ax_i, b_i, M_inv,
-                                             x0_i, tol=tol, maxiter=maxiter)
-        return jax.vmap(single, in_axes=(None, 0, 0))(Ax, b, x0)
-
-    # ---------------------------------------------------------------------
     #  main solver with Python-level chunking
     # ---------------------------------------------------------------------
-    def solve(self, vol_obs: jnp.ndarray,
+    def solve(self,
+              vol_obs: jnp.ndarray,
               distortion_model,
-              batch_size=2):
+              batch_size = 2):
         """
-        Solve the PIC-LSQ for all volumes with optional chunking.
+        Solve PIC-LSQ for all volumes with optional chunking.
 
-        Parameters
-        ----------
-        vol_obs     : (n_obs, n_vols, D, H, W)
-        distortion_model : DistortionModel
-        batch_size  : None → solve all at once (fastest if fits in RAM/GPU)
-                      int  → process at most `batch_size` volumes per JIT call
+        vol_obs   : (n_obs, n_vols, D, H, W)
+        batch_size: None → solve all volumes at once.
+                     int  → process volumes in chunks of <= batch_size.
         """
         n_obs, n_vols = vol_obs.shape[:2]
         Np = self.n_particles
-        I_precond = lambda r: r  # identity PC
+        I_precond = lambda r: r  # identity PCG pre-conditioner
 
         # ------------------------------------------------------------
-        # JIT-compiled solver for one *arbitrary-length* index array
-        # (JAX recompiles only when len(vol_idx) changes)
+        # JIT-compiled solver for an *arbitrary* batch of indices
         # ------------------------------------------------------------
-        def solve_chunk(vol_idx: jnp.ndarray):  # shape (B,)
-            B = vol_idx.shape[0]
+        def solve_chunk(vol_idx: jnp.ndarray):  # (B,)
+            B = vol_idx.shape[0]  # batch size this call
 
-            # ----- RHS --------------------------------------------------
+            # ---- RHS ---------------------------------------------------
             def rhs_one(v):
                 y = vol_obs[:, v].reshape(n_obs, -1)
                 return self.ATy(y, v, distortion_model)  # (Np,)
 
-            rhs_B = jax.vmap(rhs_one)(vol_idx)  # (B, Np)
+            rhs_B = jax.vmap(rhs_one)(vol_idx)  # (B,Np)
 
-            # ----- batched AᵀA -----------------------------------------
+            # ---- Batched operator -------------------------------------
             def ATAx_single(x, v):
                 return self.ATAx(x,
                                  vol_index=v,
@@ -262,37 +263,38 @@ class DwiOptimizer:
             ATAx_B = lambda xB: jax.vmap(ATAx_single, in_axes=(0, 0))(xB,
                                                                       vol_idx)
 
-            # ----- PCG --------------------------------------------------
+            # ---- PCG ---------------------------------------------------
             x0_B = jnp.zeros_like(rhs_B)
             rho_B = pcg_batched(ATAx_B, rhs_B, I_precond, x0_B,
-                                tol=1e-5, maxiter=10)  # (B, Np)
-            loss_B = jnp.sum((ATAx_B(rho_B) - rhs_B) ** 2, axis=1)
+                                tol=1e-5, maxiter=10)  # (B,Np)
+
+            loss_B = jnp.sum((ATAx_B(rho_B) - rhs_B) ** 2, axis=1)  # (B,)
             return rho_B, loss_B
 
-        solve_chunk_jit = jax.jit(solve_chunk)  # one compilation / shape
+        solve_chunk_jit = jax.jit(solve_chunk)  # at most two compilations
 
         # ------------------------------------------------------------
-        # 1.  No chunking  →  all volumes together
+        # 0.  No chunking → single call
         # ------------------------------------------------------------
         if batch_size is None or batch_size >= n_vols:
-            return solve_chunk_jit(jnp.arange(n_vols))
+            return solve_chunk_jit(jnp.arange(n_vols, dtype=jnp.int32))
 
         # ------------------------------------------------------------
-        # 2.  Python-level chunk loop
+        # 1.  Chunk loop in Python
         # ------------------------------------------------------------
         rhos = []
         losses = []
         for start in range(0, n_vols, batch_size):
             end = min(start + batch_size, n_vols)
-            indices = jnp.arange(start, end, dtype=jnp.int32)
-            rho_B, loss_B = solve_chunk_jit(indices)  # (B,Np), (B,)
+            idx_arr = jnp.arange(start, end,
+                                 dtype=jnp.int32)  # concrete indices
+            rho_B, loss_B = solve_chunk_jit(idx_arr)
             rhos.append(rho_B)
             losses.append(loss_B)
 
-        rho_all = jnp.concatenate(rhos, axis=0)  # (n_vols, Np)
+        rho_all = jnp.concatenate(rhos, axis=0)  # (n_vols,Np)
         loss_all = jnp.concatenate(losses, axis=0)  # (n_vols,)
         return rho_all, jnp.sum(loss_all)
-
     # def solve(self, vol_obs: jnp.ndarray,
     #           distortion_model):
     #     """
@@ -541,13 +543,13 @@ if __name__ == "__main__":
     # jax.profiler.start_trace(logdir)
     # start_time = time.time()
 
-    image_config_file = "/home/laurin/workspace/PyHySCO/data/raw/lowres/image_config.json"
+    image_config_file = "/home/laurin/workspace/PyHySCO/data/raw/highres/image_config.json"
     device =  'cpu'
     pair_idx = [0,1,2,3]
     # pair_idx = 0
     data = MultiPeDtiData(image_config_file, device=device, dtype=torch.float32, pair_idx=pair_idx)
 
-    target_res = [*data.m[:-2], 66, 66]
+    target_res = [*data.m[:-2], 128, 128]
     target_res = torch.tensor(target_res, dtype=torch.int32, device=device)
     initialization = InitializeCFMultiePeDtiDataResampled()
     B0 = initialization.eval(data, target_res, blur_result=True)

@@ -134,6 +134,8 @@ def make_stencil_builder(omega: jnp.ndarray,
 
     return stencil_fn
 
+
+
 #
 #
 #
