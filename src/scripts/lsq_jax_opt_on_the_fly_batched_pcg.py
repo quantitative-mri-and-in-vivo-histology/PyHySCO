@@ -208,35 +208,90 @@ class DwiOptimizer:
     # ---------------------------------------------------------------------
     # main solver
     # ---------------------------------------------------------------------
+    # ---------------------------------------------------------------------
+    #  batched PCG helper (same as before)
+    # ---------------------------------------------------------------------
+    def pcg_batched(Ax, b, M_inv, x0, tol=1e-6, maxiter=50):
+        # one-line wrapper that vmaps the scalar pcg over batch dim
+        single = lambda Ax_i, b_i, x0_i: pcg(Ax_i, b_i, M_inv,
+                                             x0_i, tol=tol, maxiter=maxiter)
+        return jax.vmap(single, in_axes=(None, 0, 0))(Ax, b, x0)
+
+    # ---------------------------------------------------------------------
+    #  main solver with Python-level chunking
+    # ---------------------------------------------------------------------
     def solve(self, vol_obs: jnp.ndarray,
               distortion_model,
-              batch_size = 5):
-        ...
+              batch_size=2):
+        """
+        Solve the PIC-LSQ for all volumes with optional chunking.
+
+        Parameters
+        ----------
+        vol_obs     : (n_obs, n_vols, D, H, W)
+        distortion_model : DistortionModel
+        batch_size  : None → solve all at once (fastest if fits in RAM/GPU)
+                      int  → process at most `batch_size` volumes per JIT call
+        """
+        n_obs, n_vols = vol_obs.shape[:2]
+        Np = self.n_particles
+        I_precond = lambda r: r  # identity PC
+
+        # ------------------------------------------------------------
+        # JIT-compiled solver for one *arbitrary-length* index array
+        # (JAX recompiles only when len(vol_idx) changes)
+        # ------------------------------------------------------------
+        def solve_chunk(vol_idx: jnp.ndarray):  # shape (B,)
+            B = vol_idx.shape[0]
+
+            # ----- RHS --------------------------------------------------
+            def rhs_one(v):
+                y = vol_obs[:, v].reshape(n_obs, -1)
+                return self.ATy(y, v, distortion_model)  # (Np,)
+
+            rhs_B = jax.vmap(rhs_one)(vol_idx)  # (B, Np)
+
+            # ----- batched AᵀA -----------------------------------------
+            def ATAx_single(x, v):
+                return self.ATAx(x,
+                                 vol_index=v,
+                                 n_obs=n_obs,
+                                 lambda_smooth=self.lambda_smooth,
+                                 distortion_model=distortion_model)
+
+            ATAx_B = lambda xB: jax.vmap(ATAx_single, in_axes=(0, 0))(xB,
+                                                                      vol_idx)
+
+            # ----- PCG --------------------------------------------------
+            x0_B = jnp.zeros_like(rhs_B)
+            rho_B = pcg_batched(ATAx_B, rhs_B, I_precond, x0_B,
+                                tol=1e-5, maxiter=10)  # (B, Np)
+            loss_B = jnp.sum((ATAx_B(rho_B) - rhs_B) ** 2, axis=1)
+            return rho_B, loss_B
+
+        solve_chunk_jit = jax.jit(solve_chunk)  # one compilation / shape
+
+        # ------------------------------------------------------------
+        # 1.  No chunking  →  all volumes together
+        # ------------------------------------------------------------
         if batch_size is None or batch_size >= n_vols:
-            rho_batch, loss_batch = solve_chunk_jit(jnp.arange(n_vols))
-        else:
-            chunk_tags = _chunk_indices(n_vols, batch_size)  # (n_vols,)
-            n_chunks = int(chunk_tags[-1]) + 1
+            return solve_chunk_jit(jnp.arange(n_vols))
 
-            def body(tag):
-                mask = (chunk_tags == tag)  # bool mask
-                all_ids = jnp.arange(n_vols)
-                vol_ids = jnp.where(mask, all_ids, -1)  # pad with -1
-                vol_ids = vol_ids[vol_ids >= 0]  # 🚫 ❌ NOT ALLOWED in JAX
+        # ------------------------------------------------------------
+        # 2.  Python-level chunk loop
+        # ------------------------------------------------------------
+        rhos = []
+        losses = []
+        for start in range(0, n_vols, batch_size):
+            end = min(start + batch_size, n_vols)
+            indices = jnp.arange(start, end, dtype=jnp.int32)
+            rho_B, loss_B = solve_chunk_jit(indices)  # (B,Np), (B,)
+            rhos.append(rho_B)
+            losses.append(loss_B)
 
-                # instead, make this:
-                indices = jnp.where(mask)[0]  # all valid indices
-                padded = jnp.full((batch_size,), -1)
-                padded = padded.at[:indices.shape[0]].set(indices)
-                valid_count = indices.shape[0]
-
-                # solve_chunk_jit expects a (≤B,) array of indices
-                rho, loss = solve_chunk_jit(padded[:valid_count])
-                return rho, loss
-
-            rho_list, loss_list = lax.map(body, jnp.arange(n_chunks))
-            rho_batch = jnp.concatenate(rho_list, axis=0)
-            loss_batch = jnp.concatenate(loss_list, axis=0)
+        rho_all = jnp.concatenate(rhos, axis=0)  # (n_vols, Np)
+        loss_all = jnp.concatenate(losses, axis=0)  # (n_vols,)
+        return rho_all, jnp.sum(loss_all)
 
     # def solve(self, vol_obs: jnp.ndarray,
     #           distortion_model):
@@ -486,13 +541,13 @@ if __name__ == "__main__":
     # jax.profiler.start_trace(logdir)
     # start_time = time.time()
 
-    image_config_file = "/home/laurin/workspace/PyHySCO/data/raw/highres/image_config.json"
+    image_config_file = "/home/laurin/workspace/PyHySCO/data/raw/lowres/image_config.json"
     device =  'cpu'
     pair_idx = [0,1,2,3]
     # pair_idx = 0
     data = MultiPeDtiData(image_config_file, device=device, dtype=torch.float32, pair_idx=pair_idx)
 
-    target_res = [*data.m[:-2], 128, 128]
+    target_res = [*data.m[:-2], 66, 66]
     target_res = torch.tensor(target_res, dtype=torch.int32, device=device)
     initialization = InitializeCFMultiePeDtiDataResampled()
     B0 = initialization.eval(data, target_res, blur_result=True)

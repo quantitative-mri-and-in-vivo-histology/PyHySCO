@@ -406,13 +406,13 @@ if __name__ == "__main__":
     # jax.profiler.start_trace(logdir)
     # start_time = time.time()
 
-    image_config_file = "/home/laurin/workspace/PyHySCO/data/raw/highres/image_config.json"
+    image_config_file = "/home/laurin/workspace/PyHySCO/data/raw/lowres/image_config.json"
     device =  'cpu'
     pair_idx = [0,1,2,3]
     # pair_idx = 0
     data = MultiPeDtiData(image_config_file, device=device, dtype=torch.float32, pair_idx=pair_idx)
 
-    target_res = [*data.m[:-2], 128, 128]
+    target_res = [*data.m[:-2], 66, 66]
     target_res = torch.tensor(target_res, dtype=torch.int32, device=device)
     initialization = InitializeCFMultiePeDtiDataResampled()
     B0 = initialization.eval(data, target_res, blur_result=True)
