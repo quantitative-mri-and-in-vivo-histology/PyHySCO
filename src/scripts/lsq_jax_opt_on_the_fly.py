@@ -192,7 +192,9 @@ class DwiOptimizer:
             loss = jnp.sum((ATAx_fn(rho_est) - rhs) ** 2)
             return rho_est, loss
 
-        rho_all, loss_all = lax.map(solve_one, jnp.arange(n_vols), batch_size=15)
+        rho_all, loss_all = lax.map(solve_one, jnp.arange(n_vols), batch_size=10)
+        # rho_all, loss_all = lax.map(solve_one, jnp.arange(5),
+        #                             batch_size=5)
         total_loss = jnp.sum(loss_all)
         return rho_all, total_loss
 
@@ -210,10 +212,6 @@ class DwiOptimizer:
             xp = distortion_model.apply(self.xp_base, k, vol_index)  # (3, Np)
 
             # --- 2. build 27-point PIC stencil ----------------------------------
-            # idx, w = build_pic_stencils_3d(self.omega,
-            #                                self.m_cell,
-            #                                self.m_part,
-            #                                xp)
             idx, w = self.stencil_build_fn(xp)
 
             # --- 3. apply adjoint ----------------------------------------------
@@ -524,7 +522,7 @@ if __name__ == "__main__":
 
     image_config_file = "/home/laurin/workspace/PyHySCO/data/raw/lowres/image_config.json"
     device =  'cpu'
-    pair_idx = [0,1,2,3]
+    pair_idx = [0,1]
     # pair_idx = 0
     data = MultiPeDtiData(image_config_file, device=device, dtype=torch.float32, pair_idx=pair_idx)
 
