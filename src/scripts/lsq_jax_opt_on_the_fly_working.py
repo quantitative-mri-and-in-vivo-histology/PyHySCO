@@ -61,8 +61,11 @@ from EPI_MRI.utils import save_data
 import nibabel as nib
 from typing import NamedTuple
 from particle_in_cell_utils import *
-from particle_in_cell_utils import _b_kernel_integrated
 from scripts.lsq_jax_motion_per_pe import batch_solve
+
+PWIDTH = 1
+W = 2 * PWIDTH + 1
+N_OFF = W ** 3  # Total offset buckets
 
 
 def pose_to_matrix(theta_row):
@@ -165,41 +168,146 @@ class DwiOptimizer:
                 + jnp.arange(self.m_part[2])[None, None, :]).reshape(-1)
         # ------------------------------------------------------------
 
-
-    @partial(jax.jit, static_argnums=(0,2))
-    def solve(self, vol_obs: jnp.ndarray,
+    # ----------------------------------------------------------------------
+    #  DwiOptimizer.solve – pre-compute stencils once per volume
+    # ----------------------------------------------------------------------
+    @partial(jax.jit, static_argnums=(0, 2))  # self, distortion_model
+    def solve(self,
+              vol_obs: jnp.ndarray,  # (n_obs, n_vols, …)
               distortion_model):
         """
-        Runs ATAx-based PIC-LSQ for each volume (via lax.map).
+        Reconstruct every volume with CG.  For each volume we
+        1) build all PIC stencils once,
+        2) close them over a jit-compiled mat-vec,
+        3) run CG.
+
+        This removes the expensive stencil build from the inner loop.
         """
-        n_vols = vol_obs.shape[1]
-        n_obs = vol_obs.shape[0]
-        M_inv = lambda r: r
+        n_obs = vol_obs.shape[0]  # # phase-enc. dirs
+        n_vols = vol_obs.shape[1]  # # DW volumes
+        M_inv = lambda r: r  # Jacobi ≈ identity
 
-        def solve_one(vol_index):
-            with jax.profiler.TraceAnnotation("solve_one"):
-                rho_init = jnp.zeros(
-                    self.m_part[0] * self.m_part[1] * self.m_part[2])
+        # ------------------------------------------------------------------
+        # per-volume work – will be vectorised by lax.map
+        # ------------------------------------------------------------------
+        def solve_one(vol_index: int):
+            """
+            Jitted body run by lax.map over volumes.
+            Pre-computes (idx,w) for every observation k in this volume,
+            then calls CG with a closure that takes them as *runtime* inputs.
+            """
+            # -----------------------------------------
+            # 0. some handy locals
+            # -----------------------------------------
+            n_obs = vol_obs.shape[0]
+            dtype = vol_obs.dtype
+            x0 = jnp.zeros(self.n_particles, dtype)
 
-                y = vol_obs[:, vol_index].reshape(vol_obs.shape[0], -1)
-                rhs = self.ATy(y, vol_index, distortion_model)
-                ATAx_fn = partial(self.ATAx,
-                                  vol_index=vol_index,
-                                  n_obs=n_obs,
-                                  lambda_smooth=self.lambda_smooth,
-                                  distortion_model=distortion_model)
-                rho_est, _ = jax.scipy.sparse.linalg.cg(ATAx_fn, rhs, M=M_inv, x0=rho_init,
-                                                        tol=1e-5, maxiter=10)
-                loss = jnp.sum((ATAx_fn(rho_est) - rhs) ** 2)
-                return rho_est, loss
+            # -----------------------------------------
+            # 1. RHS  b = (1/n) Σ_k T_kᵀ y_k
+            # -----------------------------------------
+            y = vol_obs[:, vol_index].reshape(n_obs, -1)
+            b = self.ATy(y, vol_index, distortion_model)  # (N,)
 
-        rho_all, loss_all = lax.map(solve_one, jnp.arange(n_vols), batch_size=2)
-        # rho_all, loss_all = lax.map(solve_one, jnp.arange(5),
-        #                             batch_size=5)
-        total_loss = jnp.sum(loss_all)
-        return rho_all, total_loss
+            # -----------------------------------------
+            # 2. build *all* stencils for this volume
+            #    idx_all , w_all : (n_obs, N_particles, S)
+            # -----------------------------------------
+            def build_stencil(k):
+                xp = distortion_model.apply(self.xp_base, k, vol_index)  # (3,N)
+                return self.stencil_build_fn(xp)
 
-    @partial(jax.jit, static_argnums=(0, 3))
+            idx_all, w_all = jax.vmap(build_stencil)(
+                jnp.arange(n_obs, dtype=jnp.int32))
+
+            def ATAx_cached(r: jnp.ndarray, idx_all: jnp.ndarray,
+                            w_all: jnp.ndarray) -> jnp.ndarray:
+                """
+                r        : (N_particles,)
+                idx_all  : (n_obs, N_particles, S)
+                w_all    : (n_obs, N_particles, S)
+                returns  : (N_particles,)   = (1/n_obs) Σ_k T_kᵀ T_k r + λ Δr
+                """
+                n_obs, N, S = idx_all.shape
+
+                # 1. Forward: T_k r for all k in one go
+                r_exp = r[None, :, None]  # (1, N, 1)
+                val_all = r_exp * w_all  # (n_obs, N, S)
+                idx_flat = idx_all.reshape(n_obs, -1)  # (n_obs, N*S)
+                val_flat = val_all.reshape(n_obs, -1)  # (n_obs, N*S)
+
+                # 2. Batched scatter using vmap
+                def scatter_one(idx, val):
+                    return jnp.zeros(self.n_cells, r.dtype).at[idx].add(val)
+
+                y_cells_all = jax.vmap(scatter_one)(idx_flat,
+                                                    val_flat)  # (n_obs, n_cells)
+
+                # 3. Adjoint: T_kᵗ y_k
+                y_gathered = jnp.take_along_axis(
+                    y_cells_all[:, None, :], idx_all, axis=-1)  # (n_obs, N, S)
+                contrib = y_gathered * w_all  # (n_obs, N, S)
+                TtT = contrib.sum(axis=-1).mean(axis=0)  # (N,)
+
+                # 4. Add smoothness term
+                if self.lambda_smooth > 0.0:
+                    TtT += self.lambda_smooth * tikhonov_like_3d_full(r,
+                                                                      self.m_part)
+
+                return TtT
+
+            # -----------------------------------------
+            # 4. run CG with the runtime-closed linear op
+            # -----------------------------------------
+            A = lambda r: ATAx_cached(r, idx_all, w_all)  # runtime closure
+            rho_est, _ = jax.scipy.sparse.linalg.cg(A, b,
+                                                    M=M_inv, x0=x0,
+                                                    tol=1e-5, maxiter=10)
+
+            loss = jnp.sum((A(rho_est) - b) ** 2)
+            return rho_est, loss
+
+        # run over all volumes
+        rho_all, loss_all = lax.map(solve_one,
+                                    jnp.arange(n_vols, dtype=jnp.int32),
+                                    batch_size=1)
+
+        return rho_all, loss_all.sum()
+
+    # @partial(jax.jit, static_argnums=(0,2))
+    # def solve(self, vol_obs: jnp.ndarray,
+    #           distortion_model):
+    #     """
+    #     Runs ATAx-based PIC-LSQ for each volume (via lax.map).
+    #     """
+    #     n_vols = vol_obs.shape[1]
+    #     n_obs = vol_obs.shape[0]
+    #     M_inv = lambda r: r
+    #
+    #     def solve_one(vol_index):
+    #         with jax.profiler.TraceAnnotation("solve_one"):
+    #             rho_init = jnp.zeros(
+    #                 self.m_part[0] * self.m_part[1] * self.m_part[2])
+    #
+    #             y = vol_obs[:, vol_index].reshape(vol_obs.shape[0], -1)
+    #             rhs = self.ATy(y, vol_index, distortion_model)
+    #             ATAx_fn = partial(self.ATAx,
+    #                               vol_index=vol_index,
+    #                               n_obs=n_obs,
+    #                               lambda_smooth=self.lambda_smooth,
+    #                               distortion_model=distortion_model)
+    #             rho_est, _ = jax.scipy.sparse.linalg.cg(ATAx_fn, rhs, M=M_inv, x0=rho_init,
+    #                                                     tol=1e-5, maxiter=10)
+    #             loss = jnp.sum((ATAx_fn(rho_est) - rhs) ** 2)
+    #             return rho_est, loss
+    #
+    #     rho_all, loss_all = lax.map(solve_one, jnp.arange(n_vols), batch_size=1)
+    #     # rho_all, loss_all = lax.map(solve_one, jnp.arange(5),
+    #     #                             batch_size=5)
+    #     total_loss = jnp.sum(loss_all)
+    #     return rho_all, total_loss
+
+    @partial(jax.jit, static_argnums=(0,3))
     def ATy(self,
             y: jnp.ndarray,  # shape (n_obs, n_cells)
             vol_index: int,
@@ -296,6 +404,45 @@ def pic_adjoint(y: jnp.ndarray,
     contrib = y[indices] * weights       # shape: (N_particles, K)
     return jnp.sum(contrib, axis=1)      # shape: (N_particles,)
 
+
+@partial(jax.jit, static_argnums=(3,))
+def pic_forward(rho, idx, w, n_cells):
+    val = (rho[:, None] * w).reshape(-1)     # (N*S,)
+    idx_flat = idx.reshape(-1)               # (N*S,)
+    return jax.ops.segment_sum(val, idx_flat, n_cells)
+
+
+def pic_normal_matvec(rho: jnp.ndarray,
+                          xp_base: jnp.ndarray,
+                          omega: jnp.ndarray,
+                          m_recon: jnp.ndarray,
+                          m_distorted: jnp.ndarray,
+                          n_cells: int,
+                          lambda_s: float):
+    """Matrix–vector product  A rho  with
+           A = Σ_k T_kᵀ T_k / n_obs  +  λ_s ∇ᵀ∇  (here laplace)"""
+
+    def single_TtT(x, idx, w):
+        y = pic_forward(x, idx, w, n_cells)  # (N,)
+        yt = pic_adjoint(y, idx, w)  # (n_cells,)
+        return yt
+
+
+    def scan_body(carry, args):
+        xp = args
+        idx, w = build_pic_stencils_3d(omega, m_distorted, m_recon, xp)
+        out = single_TtT(rho, idx, w)
+        return carry + out, None
+
+    TtT_sum, _ = jax.lax.scan(scan_body, jnp.zeros_like(rho),
+                              (xp_base))
+    TtT = TtT_sum / xp_base.shape[0]
+
+    if lambda_s > 0:
+        lap_term = tikhonov_like_3d_full(rho, m_recon)
+        TtT += lambda_s * lap_term
+
+    return TtT
 
 
 ################################################################################
@@ -408,7 +555,6 @@ if __name__ == "__main__":
     timestamp = time.strftime("%Y-%m-%d_%H-%M-%S")
     logdir = f"/home/laurin/workspace/PyHySCO/data/results/debug/tensor_logs/{timestamp}"
     os.makedirs(logdir, exist_ok=True)
-    # jax.profiler.trace_memory()
     jax.profiler.start_trace(logdir)
     # start_time = time.time()
 
@@ -517,5 +663,3 @@ if __name__ == "__main__":
 
     # Stop trace recording
     jax.profiler.stop_trace()
-
-    jax.profiler.save_device_memory_profile(os.path.join(logdir, "memory.prof"))

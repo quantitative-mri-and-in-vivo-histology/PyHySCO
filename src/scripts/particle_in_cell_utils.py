@@ -110,9 +110,13 @@ def make_stencil_builder(omega: jnp.ndarray,
     @partial(jax.jit, static_argnames=())
     def stencil_fn(xp: jnp.ndarray):                        # xp (3, N)
         # 1. Voxel coordinates & fractional parts --------------------------------
-        xv = (xp - omega[::2, None]) / part_sz[:, None]      # (3, N)
-        base = jnp.floor(xv).astype(jnp.int32)               # (3, N)
-        frac = xv - base                                     # (3, N)
+        # xv = (xp - omega[::2, None]) / part_sz[:, None]      # (3, N)
+        # base = jnp.floor(xv).astype(jnp.int32)               # (3, N)
+        # frac = xv - base                                     # (3, N)
+
+        xv = (xp - omega[::2, None]) / cell_sz[:, None]  # (3, N)
+        base = jnp.floor(xv).astype(jnp.int32)  # (3, N)
+        frac = xv - base
 
         # 2. 1‑D weights per axis ------------------------------------------------------------------
         Bz = _b_kernel_integrated(frac[0], eps[0], cell_sz[0], pwidth)  # (2p+1, N)

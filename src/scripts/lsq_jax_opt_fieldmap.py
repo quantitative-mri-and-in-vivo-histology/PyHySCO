@@ -42,6 +42,7 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 import jax.profiler
+from jax import tree_util
 from jax.profiler import annotate_function
 from jax.experimental import sparse
 from jax.scipy.sparse.linalg import cg
@@ -135,12 +136,22 @@ class DistortionModel:
 
         return xp_lin
 
+    def tree_flatten(self):
+        children = (self.bc, self.thetas, self.phase_signs, self.pe_mats)
+        aux_data = None                   # no static aux fields
+        return children, aux_data
 
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        bc, thetas, phase_signs, pe_mats = children
+        return cls(bc, thetas, phase_signs, pe_mats)
 
-class FrameParams(NamedTuple):
-    M: jnp.ndarray
-    pe_sign: float
-    eddy_coeff: jnp.ndarray
+tree_util.register_pytree_node(
+    DistortionModel,
+    DistortionModel.tree_flatten,
+    DistortionModel.tree_unflatten,
+)
+
 
 class DwiOptimizer:
     def __init__(self, omega: jnp.ndarray, m_part: Tuple[int, int, int], m_cell: Tuple[int, int, int]):
@@ -157,7 +168,7 @@ class DwiOptimizer:
         self.xp_base = self.xp_base.transpose(1, 0)
         self.xp_base = self.xp_base.reshape(3, *target_res[-3:])
         self.xp_base = self.xp_base.reshape(*self.xp_base.shape[0:3], -1)
-        self.lambda_smooth = 0.1
+        self.lambda_smooth = 0.5
         self.stencil_build_fn = make_stencil_builder(self.omega, self.m_cell, self.m_part)
         self.part_lin = (
                 (jnp.arange(self.m_part[0])[:, None, None] * self.m_part[1]
@@ -174,8 +185,9 @@ class DwiOptimizer:
         """
         n_vols = vol_obs.shape[1]
         n_obs = vol_obs.shape[0]
-        M_inv = lambda r: r
+        # M_inv = lambda r: r
 
+        @jax.checkpoint
         def solve_one(vol_index):
             with jax.profiler.TraceAnnotation("solve_one"):
                 rho_init = jnp.zeros(
@@ -183,20 +195,21 @@ class DwiOptimizer:
 
                 y = vol_obs[:, vol_index].reshape(vol_obs.shape[0], -1)
                 rhs = self.ATy(y, vol_index, distortion_model)
+                M_inv = self._build_precond(distortion_model, vol_index, n_obs)
                 ATAx_fn = partial(self.ATAx,
                                   vol_index=vol_index,
                                   n_obs=n_obs,
                                   lambda_smooth=self.lambda_smooth,
                                   distortion_model=distortion_model)
                 rho_est, _ = jax.scipy.sparse.linalg.cg(ATAx_fn, rhs, M=M_inv, x0=rho_init,
-                                                        tol=1e-5, maxiter=10)
+                                                        tol=1e-3, maxiter=10)
                 loss = jnp.sum((ATAx_fn(rho_est) - rhs) ** 2)
                 return rho_est, loss
 
-        rho_all, loss_all = lax.map(solve_one, jnp.arange(n_vols), batch_size=2)
+        rho_all, loss_all = lax.map(solve_one, jnp.arange(n_vols), batch_size=1)
         # rho_all, loss_all = lax.map(solve_one, jnp.arange(5),
         #                             batch_size=5)
-        total_loss = jnp.sum(loss_all)
+        total_loss = jnp.mean(loss_all)
         return rho_all, total_loss
 
     @partial(jax.jit, static_argnums=(0, 3))
@@ -268,6 +281,30 @@ class DwiOptimizer:
             TtT += lambda_smooth * tikhonov_like_3d_full(x, self.m_part)
 
         return TtT
+
+    # @partial(jax.jit, static_argnums=(0, 1, 3))
+    def _build_precond(self, distortion_model, vol_index: int, n_obs):
+        """
+        Return a function  M(x) = D⁻¹·x
+        where D = diag( (1/n_obs) Σ_k T_kᵀ T_k + λ_s Δ ) for a given volume.
+        """
+        lambda_s = self.lambda_smooth
+
+        def obs_contrib(k, acc):
+            xp = distortion_model.apply(self.xp_base, k,
+                                        vol_index)  # ← volume-aware
+            idx, w = self.stencil_build_fn(xp)
+            acc += jnp.sum(w ** 2, axis=1)
+            return acc
+
+        diag = lax.fori_loop(
+            0, n_obs, obs_contrib,
+            jnp.zeros(self.n_particles, dtype=jnp.float32)
+        ) / n_obs
+
+        diag += lambda_s * 6.0
+        inv_diag = 1.0 / jnp.where(diag > 1e-6, diag, 1e-6)
+        return lambda x: inv_diag * x
 
 
 def save_jax_data(data, filepath, affine=None):
@@ -341,8 +378,6 @@ def tikhonov_like_3d_full(r, spatial_size):
     return (dzt + dyt + dxt).reshape(-1)
 
 
-
-
 def laplacian_conv(x, spatial):
     D,H,W = spatial
     K = jnp.array([[[0,0,0],
@@ -397,6 +432,44 @@ def smooth_loss_fn(x):
     return jnp.sum(lap ** 2)
 
 
+
+
+def loss_fn(params: Params,
+            xp_base: jnp.ndarray,
+            dwi_images: jnp.ndarray,
+            omega: jnp.ndarray,
+            m_part: Tuple[int, int, int],
+            m_cell: Tuple[int, int, int],
+            phase_signs: jnp.ndarray,
+            pe_mats: jnp.ndarray,
+            weight_bc: float = 1e-3,
+            weight_motion: float = 1e-4):
+
+    # 1) rebuild distortion model with current (bc, theta)
+    dist = DistortionModel(params.bc, params.theta, phase_signs, pe_mats)
+
+    # 2) run the PIC–LSQ solver (differentiable through CG)
+    optim = DwiOptimizer(omega, m_part=m_part, m_cell=m_cell)
+    recon, data_term = optim.solve(dwi_images, dist)  # data_term already ∑k‖Tρ−y‖²
+
+    # 3) field-map smoothness   (∥∇bc∥² in voxel space)
+    bc_smooth = jnp.mean(laplacian_3d(params.bc) ** 2)
+
+    # 4) motion quadratic penalty
+    motion_penalty = jnp.mean(params.theta ** 2)
+
+    # 5) total loss
+    total = data_term + weight_bc * bc_smooth + weight_motion * motion_penalty
+    return total, (data_term, bc_smooth, motion_penalty, recon)
+
+
+
+
+
+
+
+
+
 class Params(NamedTuple):
     bc: jnp.ndarray        # fieldmap shift: shape (3, Dz, Dy, Dx)
     theta: jnp.ndarray
@@ -405,20 +478,20 @@ class Params(NamedTuple):
 if __name__ == "__main__":
     import numpy as np
 
-    timestamp = time.strftime("%Y-%m-%d_%H-%M-%S")
-    logdir = f"/home/laurin/workspace/PyHySCO/data/results/debug/tensor_logs/{timestamp}"
-    os.makedirs(logdir, exist_ok=True)
-    # jax.profiler.trace_memory()
-    jax.profiler.start_trace(logdir)
-    # start_time = time.time()
+    # timestamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+    # logdir = f"/home/laurin/workspace/PyHySCO/data/results/debug/tensor_logs/{timestamp}"
+    # os.makedirs(logdir, exist_ok=True)
+    # # jax.profiler.trace_memory()
+    # jax.profiler.start_trace(logdir)
+    # # start_time = time.time()
 
-    image_config_file = "/home/laurin/workspace/PyHySCO/data/raw/highres/image_config.json"
+    image_config_file = "/home/laurin/workspace/PyHySCO/data/raw/lowres/image_config.json"
     device =  'cpu'
     pair_idx = [0,1,2,3]
     # pair_idx = 0
     data = MultiPeDtiData(image_config_file, device=device, dtype=torch.float32, pair_idx=pair_idx)
 
-    target_res = [*data.m[:-2], 128, 128]
+    target_res = [*data.m[:-2], 66, 66]
     target_res = torch.tensor(target_res, dtype=torch.int32, device=device)
     initialization = InitializeCFMultiePeDtiDataResampled()
     B0 = initialization.eval(data, target_res, blur_result=True)
@@ -492,30 +565,112 @@ if __name__ == "__main__":
     # omega_3d[2].item(), omega_3d[3].item(), omega_3d[4].item(),
     # omega_3d[5].item(), omega_3d[6].item(), omega_3d[7].item())
 
+
+
+    # optimizer = DwiOptimizer(omega_3d, m_part=target_res_tuple, m_cell=m_distorted_tuple)
+    #
+    # start_time = time.time()
+    #
+    # recon, data_loss = optimizer.solve(dwi_images, distortion_model)
+    #
+    # # Compute data term
+    # data_loss = jnp.mean(data_loss)
+
     params = Params(
         bc=bc_3d,  # your initial fieldmap
         theta=thetas  # zeros of shape (N_pairs, 6)
     )
 
-    optimizer = DwiOptimizer(omega_3d, m_part=target_res_tuple, m_cell=m_distorted_tuple)
+    # opt = optax.adam(learning_rate=0.1)
 
-    start_time = time.time()
+    schedule = optax.exponential_decay(
+        init_value=0.5,  # start high
+        transition_steps=50,
+        decay_rate=0.95,  # multiply LR by this every 100 steps
+        staircase=True
+    )
 
-    recon, data_loss = optimizer.solve(dwi_images, distortion_model)
+    opt = optax.adam(schedule)
 
-    # Compute data term
-    data_loss = jnp.mean(data_loss)
+    opt_state = opt.init(params)
+    num_steps = 50
+    lambda_bc = 1e7
+    lambda_motion = 0
+    loss_grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
 
-    end = time.time()
-    print(f"Took {end - start_time:.4f} seconds")
+    for step in range(num_steps):
+        (loss_val, (data_term, smooth_term, motion_term, recon)), grads = \
+            loss_grad_fn(params, xp_base, dwi_images,
+                         omega_3d,  # same as `omega`
+                         target_res_tuple, m_distorted_tuple,
+                         phase_signs, phase_encoding_mats,
+                         weight_bc=lambda_bc,
+                         weight_motion=lambda_motion)
 
-    save_jax_data(recon.reshape(*target_res).transpose(3, 2, 1, 0),
-                  f"/home/laurin/workspace/PyHySCO/data/results/debug/recon.nii.gz")
+        updates, opt_state = opt.update(grads, opt_state, params)
+        params = optax.apply_updates(params, updates)
 
-    # Wait briefly to ensure all ops complete
-    jax.block_until_ready(recon)
+        print(f"step {step:3d} | L={loss_val:9.3e} | "
+              f"D={data_term:9.3e}  S={smooth_term:9.3e}  M={motion_term:9.3e}")
 
-    # Stop trace recording
-    jax.profiler.stop_trace()
 
-    jax.profiler.save_device_memory_profile(os.path.join(logdir, "memory.prof"))
+        save_jax_data(recon.reshape(*target_res).transpose(3, 2, 1, 0),
+                          f"/home/laurin/workspace/PyHySCO/data/results/debug/recon_moco_first_{step}.nii.gz")
+        save_jax_data(params.bc.reshape(3, *target_res[1:]).transpose(3, 2, 1, 0),
+                      f"/home/laurin/workspace/PyHySCO/data/results/debug/bc_{step}.nii.gz")
+        save_jax_data(grads.bc.reshape(3, *target_res[1:]).transpose(3, 2, 1, 0),
+                      f"/home/laurin/workspace/PyHySCO/data/results/debug/grad_bc_{step}.nii.gz")
+
+
+
+
+
+    #
+    # # loss_fn = make_loss_fn(unflatten, xp_base, dwi_images, omega_3d, target_res_tuple, m_distorted_tuple, data)
+    #
+    # for step in range(num_steps):
+    #
+    #     (loss_value, (data_term, smooth_term, motion_term, recon)), grads = \
+    #         jax.value_and_grad(loss_fn, has_aux=True)(params,
+    #                                                   xp_base, dwi_images,
+    #                                                   omega_3d,
+    #                                                   target_res_tuple,
+    #                                                   m_distorted_tuple, data,
+    #                                                   weight_bc=lambda_bc,
+    #                                                   weight_motion=lambda_motion)
+    #
+    #     updates, opt_state = opt.update(grads, opt_state, params)
+    #     params = optax.apply_updates(params, updates)
+    #
+    #
+    #     print(f"Step {step}: loss={loss_value:.4e}  "
+    #           f"data={data_term:.4e}  smooth={smooth_term:.4e}  "
+    #           f"motion={motion_term:.4e}")
+    #
+    #     # print(f"{step}: loss = {total_loss:.4e}")
+    #
+    #     save_jax_data(recon.reshape(*target_res).transpose(3, 2, 1, 0),
+    #                   f"/home/laurin/workspace/PyHySCO/data/results/debug/recon_moco_first_{step}.nii.gz")
+    #     # save_jax_data(total_grad.transpose(3, 2, 1, 0),
+    #     #               f"/home/laurin/workspace/PyHySCO/data/results/debug/grad_{step}.nii.gz")
+    #     # save_jax_data(bc_3d.transpose(3, 2, 1, 0),
+    #     #               f"/home/laurin/workspace/PyHySCO/data/results/debug/bc_3d_{step}.nii.gz")
+    #     # save_jax_data(smooth_grad.transpose(3, 2, 1, 0),
+    #     #               f"/home/laurin/workspace/PyHySCO/data/results/debug/grad_smooth_{step}.nii.gz")
+    #     # save_jax_data(data_grad.transpose(3, 2, 1, 0),
+    #     #               f"/home/laurin/workspace/PyHySCO/data/results/debug/grad_data_{step}.nii.gz")
+    #
+    #
+    # end = time.time()
+    # print(f"Took {end - start_time:.4f} seconds")
+    #
+    # # save_jax_data(recon.reshape(*target_res).transpose(3, 2, 1, 0),
+    # #               f"/home/laurin/workspace/PyHySCO/data/results/debug/recon.nii.gz")
+    #
+    # # # Wait briefly to ensure all ops complete
+    # # jax.block_until_ready(recon)
+    # #
+    # # # Stop trace recording
+    # # jax.profiler.stop_trace()
+    # #
+    # # jax.profiler.save_device_memory_profile(os.path.join(logdir, "memory.prof"))
