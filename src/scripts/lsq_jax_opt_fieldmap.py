@@ -168,7 +168,7 @@ class DwiOptimizer:
         self.xp_base = self.xp_base.transpose(1, 0)
         self.xp_base = self.xp_base.reshape(3, *target_res[-3:])
         self.xp_base = self.xp_base.reshape(*self.xp_base.shape[0:3], -1)
-        self.lambda_smooth = 0.5
+        self.lambda_smooth = 0.25
         self.stencil_build_fn = make_stencil_builder(self.omega, self.m_cell, self.m_part)
         self.part_lin = (
                 (jnp.arange(self.m_part[0])[:, None, None] * self.m_part[1]
@@ -203,7 +203,18 @@ class DwiOptimizer:
                                   distortion_model=distortion_model)
                 rho_est, _ = jax.scipy.sparse.linalg.cg(ATAx_fn, rhs, M=M_inv, x0=rho_init,
                                                         tol=1e-3, maxiter=10)
-                loss = jnp.sum((ATAx_fn(rho_est) - rhs) ** 2)
+
+                # True data residual: ∑ₖ ‖Tₖ rho − yₖ‖²
+                def forward_error(k, err_sum):
+                    xp = distortion_model.apply(self.xp_base, k, vol_index)
+                    idx, w = self.stencil_build_fn(xp)
+                    y_pred = jnp.sum(rho_est[idx] * w, axis=1)
+                    err = jnp.sum((y_pred - y[k]) ** 2)
+                    return err_sum + err
+
+                loss = lax.fori_loop(0, n_obs, forward_error, 0.0)
+
+                # loss = jnp.sum((ATAx_fn(rho_est) - rhs) ** 2)
                 return rho_est, loss
 
         rho_all, loss_all = lax.map(solve_one, jnp.arange(n_vols), batch_size=1)
@@ -453,7 +464,7 @@ def loss_fn(params: Params,
     recon, data_term = optim.solve(dwi_images, dist)  # data_term already ∑k‖Tρ−y‖²
 
     # 3) field-map smoothness   (∥∇bc∥² in voxel space)
-    bc_smooth = jnp.mean(laplacian_3d(params.bc) ** 2)
+    bc_smooth = jnp.sum(laplacian_3d(params.bc) ** 2)
 
     # 4) motion quadratic penalty
     motion_penalty = jnp.mean(params.theta ** 2)
@@ -584,7 +595,7 @@ if __name__ == "__main__":
     # opt = optax.adam(learning_rate=0.1)
 
     schedule = optax.exponential_decay(
-        init_value=0.5,  # start high
+        init_value=0.2,  # start high
         transition_steps=50,
         decay_rate=0.95,  # multiply LR by this every 100 steps
         staircase=True
@@ -594,7 +605,7 @@ if __name__ == "__main__":
 
     opt_state = opt.init(params)
     num_steps = 50
-    lambda_bc = 1e7
+    lambda_bc = 1
     lambda_motion = 0
     loss_grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
 

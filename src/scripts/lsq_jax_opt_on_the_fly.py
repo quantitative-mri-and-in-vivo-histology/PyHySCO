@@ -34,6 +34,7 @@ from sympy.physics.vector import outer
 
 # os.environ["XLA_FLAGS"] = "--xla_cpu_enable_fast_math=false --xla_gpu_autotune_level=3"
 # os.environ["XLA_FLAGS"] = " --xla_disable_hlo_fusion=true"
+# os.environ["XLA_FLAGS"] = "--xla_gpu_enable_memory_statistics"
 
 import gc
 
@@ -193,7 +194,7 @@ class DwiOptimizer:
                 loss = jnp.sum((ATAx_fn(rho_est) - rhs) ** 2)
                 return rho_est, loss
 
-        rho_all, loss_all = lax.map(solve_one, jnp.arange(n_vols), batch_size=2)
+        rho_all, loss_all = lax.map(solve_one, jnp.arange(n_vols), batch_size=1)
         # rho_all, loss_all = lax.map(solve_one, jnp.arange(5),
         #                             batch_size=5)
         total_loss = jnp.sum(loss_all)
@@ -407,9 +408,9 @@ if __name__ == "__main__":
 
     timestamp = time.strftime("%Y-%m-%d_%H-%M-%S")
     logdir = f"/home/laurin/workspace/PyHySCO/data/results/debug/tensor_logs/{timestamp}"
-    os.makedirs(logdir, exist_ok=True)
+    # os.makedirs(logdir, exist_ok=True)
     # jax.profiler.trace_memory()
-    jax.profiler.start_trace(logdir)
+    # jax.profiler.start_trace(logdir)
     # start_time = time.time()
 
     image_config_file = "/home/laurin/workspace/PyHySCO/data/raw/highres/image_config.json"
@@ -513,9 +514,9 @@ if __name__ == "__main__":
                   f"/home/laurin/workspace/PyHySCO/data/results/debug/recon.nii.gz")
 
     # Wait briefly to ensure all ops complete
-    jax.block_until_ready(recon)
-
-    # Stop trace recording
-    jax.profiler.stop_trace()
-
-    jax.profiler.save_device_memory_profile(os.path.join(logdir, "memory.prof"))
+    # jax.block_until_ready(recon)
+    #
+    # # Stop trace recording
+    # jax.profiler.stop_trace()
+    #
+    # jax.profiler.save_device_memory_profile(os.path.join(logdir, "memory.prof"))
