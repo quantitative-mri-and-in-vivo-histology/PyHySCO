@@ -65,20 +65,10 @@ from EPI_MRI.InitializationMethods import InitializeCFMultiePeDtiDataResampled
 from EPI_MRI.utils import save_data
 import nibabel as nib
 from typing import NamedTuple
-from particle_in_cell_utils_autodiff import *
+from particle_in_cell_utils import *
+from particle_in_cell_utils import _b_kernel_integrated
+from scripts.lsq_jax_motion_per_pe import batch_solve
 from jax.tree_util import register_pytree_node_class
-
-
-class Params(NamedTuple):
-    bc: jnp.ndarray        # fieldmap shift: shape (3, Dz, Dy, Dx)
-    theta: jnp.ndarray
-
-tree_util.register_pytree_node(
-    Params,
-    lambda x: ((x.bc, x.theta), None),
-    lambda _, children: Params(*children),
-)
-
 
 
 def pose_to_matrix(theta_row):
@@ -98,6 +88,79 @@ def pose_to_matrix(theta_row):
     return M
 
 
+# class DistortionModel:
+#     def __init__(self,
+#                  bc=None,
+#                  thetas=None,
+#                  phase_signs=None,
+#                  pe_mats=None):
+#         self.bc = bc.reshape(3, -1)
+#         self.thetas = thetas
+#         self.phase_signs = phase_signs
+#         self.pe_mats = pe_mats
+#
+#     def update(self, params):
+#         self.bc = params.bc
+#         self.motion_transforms = params.motion_transforms
+#
+#     @partial(jax.jit, static_argnums=(0))
+#     def apply(self, xp_base, obs_index, volume_index):
+#
+#         # image_center = 0.5 * (
+#         #         torch.tensor(data.omega[3::2]) + torch.tensor(
+#         #     data.omega[2::2]))  # (x_c, y_c, z_c)
+#         # image_center = jnp.array(image_center.numpy())
+#         image_center = 0.5 * (
+#                     jnp.array(data.omega[3::2]) + jnp.array(data.omega[2::2]))
+#
+#
+#         image_center_res = image_center.reshape(3,1,1,1)
+#
+#
+#         ref_mat = jnp.array(self.pe_mats[0][0])
+#         # bc = self.bc
+#         theta = self.thetas[obs_index, volume_index]
+#         motion_transform = pose_to_matrix(theta)
+#
+#         T_motion_k_pe = motion_transform  # canonical-mm → moved canonical-mm
+#
+#         roi_mat = jnp.array(self.pe_mats[obs_index, volume_index])
+#         T_mat_permuted = jnp.linalg.inv(roi_mat) @ ref_mat
+#         T_voxel_to_mm = jnp.eye(4) * (1 / jnp.array(
+#             [data.omega[3], data.omega[5], data.omega[7], 1]))
+#         T_mm_to_voxel = jnp.eye(4) * (jnp.array(
+#             [data.omega[3], data.omega[5], data.omega[7], 1]))
+#         T_fixed = T_voxel_to_mm @ T_mat_permuted @ T_mm_to_voxel
+#         rot_mat_permuted = T_mat_permuted[:3, :3]
+#
+#         # xp_pe = xp_base.reshape(3, -1)
+#         # xp_lin = xp_pe + self.phase_signs[obs_index, volume_index] * self.bc
+#         # xp_lin = rot_mat_permuted @ (xp_lin - image_center.reshape(-1,
+#         #                                                            1)) + image_center.reshape(
+#         #     -1, 1)
+#
+#         xp_lin = xp_base.reshape(3, -1) + self.phase_signs[obs_index, volume_index] * self.bc
+#         xp_lin = rot_mat_permuted @ (
+#                     xp_lin - image_center[:, None]) + image_center[:, None]
+#
+#         return xp_lin
+#
+#     def tree_flatten(self):
+#         children = (self.bc, self.thetas, self.phase_signs, self.pe_mats)
+#         aux_data = None                   # no static aux fields
+#         return children, aux_data
+#
+#     @classmethod
+#     def tree_unflatten(cls, aux_data, children):
+#         bc, thetas, phase_signs, pe_mats = children
+#         return cls(bc, thetas, phase_signs, pe_mats)
+#
+# tree_util.register_pytree_node(
+#     DistortionModel,
+#     DistortionModel.tree_flatten,
+#     DistortionModel.tree_unflatten,
+# )
+
 @register_pytree_node_class
 class DistortionModel(NamedTuple):
     bc: jnp.ndarray
@@ -106,55 +169,28 @@ class DistortionModel(NamedTuple):
     pe_mats: jnp.ndarray
 
     def apply(self, xp_base, obs_index, volume_index):
-        image_center = 0.5 * (jnp.array(data.omega[3::2]) + jnp.array(data.omega[2::2]))
-        phase_sign = self.phase_signs[obs_index, volume_index]
-        theta = self.thetas[obs_index, volume_index]
-        motion_transform = pose_to_matrix(theta).astype(jnp.float32)
-        ref_mat = self.pe_mats[0][0]
-        roi_mat = self.pe_mats[obs_index, volume_index]
-        T_mat_permuted = jnp.linalg.inv(roi_mat) @ ref_mat
-        rot = T_mat_permuted[:3, :3]
-
-        # xp_flat = xp_base.reshape(3, -1)  # shape (3, N)
-        # ones = jnp.ones((1, xp_flat.shape[1]), dtype=jnp.float32)
-        # xp_hom = jnp.vstack([xp_flat, ones])
-        # xp_moved = motion_transform @ xp_hom
-        # xp = xp_moved[:3].reshape(xp_base.shape)
-
-        # directly use the bc from this distortion model
-        pe_vec = jnp.array([0.0, 0.0, 1.0], dtype=jnp.float32)
-        xp = xp_base + phase_sign * (pe_vec[:, None, None, None] * self.bc)
-        xp = rot @ (xp.reshape(3, -1) - image_center[:, None]) + image_center[:, None]
-
-        # ones = jnp.ones((1, xp.shape[1]), dtype=jnp.float32)
-        # xp_hom = jnp.vstack([xp, ones])  # shape (4, N)
-        # xp_moved = motion_transform @ xp_hom
-        # xp = xp_moved[:3, :]
-
-        return xp
-
-    def apply_backward(self, xp_rotated, obs_index, volume_index):
         image_center = 0.5 * (
-                    jnp.array(data.omega[3::2]) + jnp.array(data.omega[2::2]))
-        phase_sign = self.phase_signs[obs_index, volume_index]
-        theta = self.thetas[obs_index, volume_index]
+            jnp.array(data.omega[3::2]) + jnp.array(data.omega[2::2]))
+
         ref_mat = self.pe_mats[0][0]
+        theta = self.thetas[obs_index, volume_index]
+        motion_transform = pose_to_matrix(theta)
+
         roi_mat = self.pe_mats[obs_index, volume_index]
         T_mat_permuted = jnp.linalg.inv(roi_mat) @ ref_mat
-        rot = T_mat_permuted[:3, :3]
-        rot_inv = jnp.linalg.inv(rot)
+        T_voxel_to_mm = jnp.eye(4) * (1 / jnp.array(
+            [data.omega[3], data.omega[5], data.omega[7], 1]))
+        T_mm_to_voxel = jnp.eye(4) * (jnp.array(
+            [data.omega[3], data.omega[5], data.omega[7], 1]))
+        rot_mat_permuted = T_mat_permuted[:3, :3]
 
-        # undo the rotation
-        xp_unrotated = rot_inv @ (xp_rotated.reshape(3, -1) - image_center[:,
-                                                              None]) + image_center[
-                                                                       :, None]
+        # Keep full spatial shape — do NOT reshape to flat
+        xp_lin = xp_base + self.phase_signs[obs_index, volume_index] * self.bc
+        xp_lin = rot_mat_permuted @ (
+            xp_lin.reshape(3, -1) - image_center[:, None]) + image_center[:, None]
 
-        # undo the fieldmap shift
-        pe_vec = jnp.array([0.0, 0.0, 1.0], dtype=jnp.float32)
-        xp_base = xp_unrotated - phase_sign * (
-                    pe_vec[:, None] * self.bc.reshape(3, -1))
-
-        return xp_base.reshape(xp_rotated.shape)
+        xp_lin = xp_lin + 0.0 * jnp.sum(self.bc)  #
+        return xp_lin
 
     def tree_flatten(self):
         # Return dynamic children, static aux_data
@@ -181,7 +217,7 @@ class DwiOptimizer:
         self.xp_base = self.xp_base.transpose(1, 0)
         self.xp_base = self.xp_base.reshape(3, *target_res[-3:])
         self.xp_base = self.xp_base.reshape(*self.xp_base.shape[0:3], -1)
-        self.lambda_smooth = 0.2
+        self.lambda_smooth = 0.3
         self.stencil_build_fn = make_stencil_builder(self.omega, self.m_cell, self.m_part)
 
         # self.stencil_build_fn = make_diff_stencil_builder(self.omega, self.m_cell, 1)
@@ -232,26 +268,17 @@ class DwiOptimizer:
                                                         tol=1e-3, maxiter=10)
                 rho_est = rho_est.astype(jnp.float32)
 
-                # push_fn = make_pushforward_fn(self.stencil_build_deriv_fn)
-
                 # True data residual: ∑ₖ ‖Tₖ rho − yₖ‖²
                 def forward_error(k, err_sum):
                     xp = distortion_model.apply(xp_base, k, vol_index)
                     idx, w = self.stencil_build_fn(xp)
-                    # y_pred = jnp.sum(rho_est[idx] * w, axis=1)
-                    # # y_pred = push_fn(rho_est, xp)
-                    # err = jnp.sum((y_pred - y[k]) ** 2)
-
-                    y_k_ref = pic_adjoint(y[k], idx, w)  # resample y_k into reference frame
-                    err = jnp.sum((rho_est - y_k_ref) ** 2)
-
+                    y_pred = jnp.sum(rho_est[idx] * w, axis=1)
+                    err = jnp.sum((y_pred - y[k]) ** 2)
                     return err_sum + err
 
                 loss = lax.fori_loop(0, n_obs, forward_error, 0.0)
 
                 # loss = jnp.sum((ATAx_fn(rho_est) - rhs) ** 2)
-
-                loss = jnp.sum((rho_est - rhs) ** 2)
                 loss = loss.astype(jnp.float32)
 
                 return rho_est, loss
@@ -391,7 +418,7 @@ def save_jax_data(data, filepath, affine=None):
     if affine is None:
         affine = np.eye(4)
     if filepath is not None:
-        save_img = nib.Nifti1Image(data, np.asarray(affine))
+        save_img = nib.Nifti1Image(data, affine)
         nib.save(save_img, filepath)
 
 
@@ -522,6 +549,10 @@ def loss_fn(params: Params,
     optim = DwiOptimizer(omega, m_part=m_part, m_cell=m_cell)
     recon, data_term = optim.solve(dwi_images, distortion_model)  # data_term already ∑k‖Tρ−y‖²
 
+    # data_term = jnp.sum(params.bc[:, 16, 32, 32] ** 2).astype(jnp.float32)
+    # data_term = jnp.sum(recon ** 2)
+    # data_term += 1e3 * jnp.sum(distortion_model.bc[:, 14:20, 30:35, 30:35] ** 2)
+    data_term += 0.0 * jnp.sum(distortion_model.bc ** 2)
 
     # 3) field-map smoothness   (∥∇bc∥² in voxel space)
     bc_smooth = jnp.sum(laplacian_3d(params.bc) ** 2)
@@ -537,6 +568,15 @@ def loss_fn(params: Params,
 
 
 
+
+
+
+
+class Params(NamedTuple):
+    bc: jnp.ndarray        # fieldmap shift: shape (3, Dz, Dy, Dx)
+    theta: jnp.ndarray
+
+
 if __name__ == "__main__":
     import numpy as np
 
@@ -547,13 +587,13 @@ if __name__ == "__main__":
     # jax.profiler.start_trace(logdir)
     # # start_time = time.time()
 
-    image_config_file = "/home/laurin/workspace/PyHySCO/data/raw/highres/image_config.json"
+    image_config_file = "/home/laurin/workspace/PyHySCO/data/raw/lowres/image_config.json"
     device =  'cpu'
     pair_idx = [0,1,2,3]
-    # pair_idx = 0
+    pair_idx = 0
     data = MultiPeDtiData(image_config_file, device=device, dtype=torch.float32, pair_idx=pair_idx)
 
-    target_res = [*data.m[:-2], 128, 128]
+    target_res = [*data.m[:-2], 66, 66]
     target_res = torch.tensor(target_res, dtype=torch.int32, device=device)
     initialization = InitializeCFMultiePeDtiDataResampled()
     B0 = initialization.eval(data, target_res, blur_result=True)
@@ -606,8 +646,14 @@ if __name__ == "__main__":
 
     dwi_images = jnp.stack(vols)
     n_obs, n_vol, D, H, W = dwi_images.shape
+    # thetas = jnp.array([1e-3, 1e-3, 1e-3, 1e-3, 1e-3, 1e-3]).reshape(1, -1).repeat(dwi_images.shape[0]*dwi_images.shape[1],
+    #                                                                       axis=0).reshape(*dwi_images.shape[:2], 6)
     thetas = jnp.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).reshape(1, -1).repeat(dwi_images.shape[0]*dwi_images.shape[1],
                                                                           axis=0).reshape(*dwi_images.shape[:2], 6)
+    # thetas = thetas.transpose(1,0,2)
+
+    # distortion_model = DistortionModel(bc_3d, thetas, phase_signs, phase_encoding_mats)
+
 
     target_res_tuple = (
     target_res[1].item(), target_res[2].item(), target_res[3].item())
@@ -617,29 +663,44 @@ if __name__ == "__main__":
 
     omega_3d = jnp.array(omega[2:], dtype=jnp.float32)
 
+    # omega_3d_tuple = (
+    # omega_3d[2].item(), omega_3d[3].item(), omega_3d[4].item(),
+    # omega_3d[5].item(), omega_3d[6].item(), omega_3d[7].item())
+
+
+
+    # optimizer = DwiOptimizer(omega_3d, m_part=target_res_tuple, m_cell=m_distorted_tuple)
+    #
+    # start_time = time.time()
+    #
+    # recon, data_loss = optimizer.solve(dwi_images, distortion_model)
+    #
+    # # Compute data term
+    # data_loss = jnp.mean(data_loss)
+
     params = Params(
         bc=bc_3d,  # your initial fieldmap
         theta=thetas  # zeros of shape (N_pairs, 6)
     )
-
-    bc_schedule = optax.exponential_decay(
-        init_value=1e-2, transition_steps=50, decay_rate=0.95, staircase=True)
-    theta_schedule = optax.constant_schedule(1e-4)
-
-    opt = optax.multi_transform(
-        {
-            'bc': optax.adam(bc_schedule),
-            'theta': optax.adam(theta_schedule),
-        },
-        param_labels={'bc': 'bc', 'theta': 'theta'}
+    params = params._replace(
+        bc=params.bc.at[:, 14:20, 30:35, 30:35].add(25.0)
     )
 
-    # opt.init(params)
-    params_dict = {'bc': params.bc, 'theta': params.theta}
-    opt_state = opt.init(params_dict)
-    num_steps = 30
-    lambda_bc = 100
-    lambda_motion = 1e10
+    # opt = optax.adam(learning_rate=0.1)
+
+    schedule = optax.exponential_decay(
+        init_value=0.2,  # start high
+        transition_steps=50,
+        decay_rate=0.95,  # multiply LR by this every 100 steps
+        staircase=True
+    )
+
+    opt = optax.adam(schedule)
+
+    opt_state = opt.init(params)
+    num_steps = 10
+    lambda_bc = 0
+    lambda_motion = 0
     loss_grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
 
     for step in range(num_steps):
@@ -651,29 +712,74 @@ if __name__ == "__main__":
                          weight_bc=lambda_bc,
                          weight_motion=lambda_motion)
 
-        grads_dict = {'bc': grads.bc, 'theta': grads.theta}
-        updates, opt_state = opt.update(grads_dict, opt_state, params_dict)
+        updates, opt_state = opt.update(grads, opt_state, params)
+        params = optax.apply_updates(params, updates)
 
-        # Apply update:
-        params_dict = optax.apply_updates(params_dict, updates)
-
-        # Optional: rewrap into Params
-        params = Params(**params_dict)
-
+        # params = params._replace(
+        #     bc=params.bc.at[:, 14:20, 30:35, 30:35].add(25.0)
+        # )
 
         print(f"step {step:3d} | L={loss_val:9.3e} | "
               f"D={data_term:9.3e}  S={smooth_term:9.3e}  M={motion_term:9.3e}")
 
 
         save_jax_data(recon.reshape(*target_res).transpose(3, 2, 1, 0),
-                          f"/home/laurin/workspace/PyHySCO/data/results/debug/recon_moco_first_{step}.nii.gz", data.mats[0])
+                          f"/home/laurin/workspace/PyHySCO/data/results/debug/recon_moco_first_{step}.nii.gz")
         save_jax_data(params.bc.reshape(3, *target_res[1:]).transpose(3, 2, 1, 0),
                       f"/home/laurin/workspace/PyHySCO/data/results/debug/bc_{step}.nii.gz")
         save_jax_data(grads.bc.reshape(3, *target_res[1:]).transpose(3, 2, 1, 0),
                       f"/home/laurin/workspace/PyHySCO/data/results/debug/grad_bc_{step}.nii.gz")
 
 
-    # # Stop trace recording
-    # jax.profiler.stop_trace()
+
+
+
     #
-    # jax.profiler.save_device_memory_profile(os.path.join(logdir, "memory.prof"))
+    # # loss_fn = make_loss_fn(unflatten, xp_base, dwi_images, omega_3d, target_res_tuple, m_distorted_tuple, data)
+    #
+    # for step in range(num_steps):
+    #
+    #     (loss_value, (data_term, smooth_term, motion_term, recon)), grads = \
+    #         jax.value_and_grad(loss_fn, has_aux=True)(params,
+    #                                                   xp_base, dwi_images,
+    #                                                   omega_3d,
+    #                                                   target_res_tuple,
+    #                                                   m_distorted_tuple, data,
+    #                                                   weight_bc=lambda_bc,
+    #                                                   weight_motion=lambda_motion)
+    #
+    #     updates, opt_state = opt.update(grads, opt_state, params)
+    #     params = optax.apply_updates(params, updates)
+    #
+    #
+    #     print(f"Step {step}: loss={loss_value:.4e}  "
+    #           f"data={data_term:.4e}  smooth={smooth_term:.4e}  "
+    #           f"motion={motion_term:.4e}")
+    #
+    #     # print(f"{step}: loss = {total_loss:.4e}")
+    #
+    #     save_jax_data(recon.reshape(*target_res).transpose(3, 2, 1, 0),
+    #                   f"/home/laurin/workspace/PyHySCO/data/results/debug/recon_moco_first_{step}.nii.gz")
+    #     # save_jax_data(total_grad.transpose(3, 2, 1, 0),
+    #     #               f"/home/laurin/workspace/PyHySCO/data/results/debug/grad_{step}.nii.gz")
+    #     # save_jax_data(bc_3d.transpose(3, 2, 1, 0),
+    #     #               f"/home/laurin/workspace/PyHySCO/data/results/debug/bc_3d_{step}.nii.gz")
+    #     # save_jax_data(smooth_grad.transpose(3, 2, 1, 0),
+    #     #               f"/home/laurin/workspace/PyHySCO/data/results/debug/grad_smooth_{step}.nii.gz")
+    #     # save_jax_data(data_grad.transpose(3, 2, 1, 0),
+    #     #               f"/home/laurin/workspace/PyHySCO/data/results/debug/grad_data_{step}.nii.gz")
+    #
+    #
+    # end = time.time()
+    # print(f"Took {end - start_time:.4f} seconds")
+    #
+    # # save_jax_data(recon.reshape(*target_res).transpose(3, 2, 1, 0),
+    # #               f"/home/laurin/workspace/PyHySCO/data/results/debug/recon.nii.gz")
+    #
+    # # # Wait briefly to ensure all ops complete
+    # # jax.block_until_ready(recon)
+    # #
+    # # # Stop trace recording
+    # # jax.profiler.stop_trace()
+    # #
+    # # jax.profiler.save_device_memory_profile(os.path.join(logdir, "memory.prof"))

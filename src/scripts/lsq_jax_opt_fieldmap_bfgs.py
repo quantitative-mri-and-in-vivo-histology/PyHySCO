@@ -67,7 +67,9 @@ import nibabel as nib
 from typing import NamedTuple
 from particle_in_cell_utils_autodiff import *
 from jax.tree_util import register_pytree_node_class
-
+from jaxopt import BFGS, LBFGS
+from jax import value_and_grad
+from jax.flatten_util import ravel_pytree
 
 class Params(NamedTuple):
     bc: jnp.ndarray        # fieldmap shift: shape (3, Dz, Dy, Dx)
@@ -536,7 +538,6 @@ def loss_fn(params: Params,
 
 
 
-
 if __name__ == "__main__":
     import numpy as np
 
@@ -622,55 +623,94 @@ if __name__ == "__main__":
         theta=thetas  # zeros of shape (N_pairs, 6)
     )
 
-    bc_schedule = optax.exponential_decay(
-        init_value=1e-2, transition_steps=50, decay_rate=0.95, staircase=True)
-    theta_schedule = optax.constant_schedule(1e-4)
-
-    opt = optax.multi_transform(
-        {
-            'bc': optax.adam(bc_schedule),
-            'theta': optax.adam(theta_schedule),
-        },
-        param_labels={'bc': 'bc', 'theta': 'theta'}
-    )
-
-    # opt.init(params)
-    params_dict = {'bc': params.bc, 'theta': params.theta}
-    opt_state = opt.init(params_dict)
-    num_steps = 30
-    lambda_bc = 100
-    lambda_motion = 1e10
-    loss_grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-
-    for step in range(num_steps):
-        (loss_val, (data_term, smooth_term, motion_term, recon)), grads = \
-            loss_grad_fn(params, xp_base, dwi_images,
-                         omega_3d,  # same as `omega`
-                         target_res_tuple, m_distorted_tuple,
-                         phase_signs, phase_encoding_mats,
-                         weight_bc=lambda_bc,
-                         weight_motion=lambda_motion)
-
-        grads_dict = {'bc': grads.bc, 'theta': grads.theta}
-        updates, opt_state = opt.update(grads_dict, opt_state, params_dict)
-
-        # Apply update:
-        params_dict = optax.apply_updates(params_dict, updates)
-
-        # Optional: rewrap into Params
-        params = Params(**params_dict)
+    # ---- 1. Flatten the Params ----
+    params_flat, unravel_fn = ravel_pytree(params)
 
 
-        print(f"step {step:3d} | L={loss_val:9.3e} | "
-              f"D={data_term:9.3e}  S={smooth_term:9.3e}  M={motion_term:9.3e}")
+    # ---- 2. Define flat loss fn for BFGS ----
+    def loss_fn_flat(x_flat):
+        params_unflat = unravel_fn(x_flat)
+        total_loss, aux = loss_fn(
+            params_unflat,
+            xp_base, dwi_images,
+            omega_3d,
+            target_res_tuple, m_distorted_tuple,
+            phase_signs, phase_encoding_mats,
+            weight_bc=100.0,
+            weight_motion=1e10,
+        )
+        return jnp.atleast_1d(total_loss)[0]
 
 
-        save_jax_data(recon.reshape(*target_res).transpose(3, 2, 1, 0),
-                          f"/home/laurin/workspace/PyHySCO/data/results/debug/recon_moco_first_{step}.nii.gz", data.mats[0])
-        save_jax_data(params.bc.reshape(3, *target_res[1:]).transpose(3, 2, 1, 0),
-                      f"/home/laurin/workspace/PyHySCO/data/results/debug/bc_{step}.nii.gz")
-        save_jax_data(grads.bc.reshape(3, *target_res[1:]).transpose(3, 2, 1, 0),
-                      f"/home/laurin/workspace/PyHySCO/data/results/debug/grad_bc_{step}.nii.gz")
+    loss_fn_flat_grad = value_and_grad(loss_fn_flat)
+
+
+    # ---- 3. Optional callback to monitor progress ----
+    def callback(xk, state):
+        print(f"[BFGS] iter {state.iter_num:2d} | loss = {state.value:.4e}")
+        return False  # return True to stop early
+
+
+    # ---- 4. Run BFGS ----
+    solver = LBFGS(fun=loss_fn_flat, value_and_grad=False, maxiter=30, verbose=True)
+    result = solver.run(params_flat)
+    params_opt = unravel_fn(result.params)
+    final_loss = result.state.value
+    print("Final loss:", final_loss)
+
+
+
+    # bc_schedule = optax.exponential_decay(
+    #     init_value=1e-2, transition_steps=50, decay_rate=0.95, staircase=True)
+    # theta_schedule = optax.constant_schedule(1e-4)
+    #
+    # opt = optax.multi_transform(
+    #     {
+    #         'bc': optax.adam(bc_schedule),
+    #         'theta': optax.adam(theta_schedule),
+    #     },
+    #     param_labels={'bc': 'bc', 'theta': 'theta'}
+    # )
+    #
+    #
+    #
+    # # opt.init(params)
+    # params_dict = {'bc': params.bc, 'theta': params.theta}
+    # opt_state = opt.init(params_dict)
+    # num_steps = 30
+    # lambda_bc = 100
+    # lambda_motion = 1e10
+    # loss_grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+    #
+    # for step in range(num_steps):
+    #     (loss_val, (data_term, smooth_term, motion_term, recon)), grads = \
+    #         loss_grad_fn(params, xp_base, dwi_images,
+    #                      omega_3d,  # same as `omega`
+    #                      target_res_tuple, m_distorted_tuple,
+    #                      phase_signs, phase_encoding_mats,
+    #                      weight_bc=lambda_bc,
+    #                      weight_motion=lambda_motion)
+    #
+    #     grads_dict = {'bc': grads.bc, 'theta': grads.theta}
+    #     updates, opt_state = opt.update(grads_dict, opt_state, params_dict)
+    #
+    #     # Apply update:
+    #     params_dict = optax.apply_updates(params_dict, updates)
+    #
+    #     # Optional: rewrap into Params
+    #     params = Params(**params_dict)
+    #
+    #
+    #     print(f"step {step:3d} | L={loss_val:9.3e} | "
+    #           f"D={data_term:9.3e}  S={smooth_term:9.3e}  M={motion_term:9.3e}")
+    #
+    #
+    #     save_jax_data(recon.reshape(*target_res).transpose(3, 2, 1, 0),
+    #                       f"/home/laurin/workspace/PyHySCO/data/results/debug/recon_moco_first_{step}.nii.gz", data.mats[0])
+    #     save_jax_data(params.bc.reshape(3, *target_res[1:]).transpose(3, 2, 1, 0),
+    #                   f"/home/laurin/workspace/PyHySCO/data/results/debug/bc_{step}.nii.gz")
+    #     save_jax_data(grads.bc.reshape(3, *target_res[1:]).transpose(3, 2, 1, 0),
+    #                   f"/home/laurin/workspace/PyHySCO/data/results/debug/grad_bc_{step}.nii.gz")
 
 
     # # Stop trace recording
