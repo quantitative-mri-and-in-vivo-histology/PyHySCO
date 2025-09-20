@@ -166,6 +166,26 @@ class DistortionModel(NamedTuple):
     def tree_unflatten(cls, aux_data, children):
         return cls(*children)
 
+
+class PICInterpolator:
+    def __init__(self, omega, m_cell, m_part):
+        self.stencil_fn = make_stencil_builder(omega, m_cell, m_part)
+
+    def forward(self, rho: jnp.ndarray, xp: jnp.ndarray) -> jnp.ndarray:
+        """Pushforward: T rho"""
+        idx, w = self.stencil_fn(xp)
+        return jnp.sum(rho[idx] * w, axis=1)
+
+    def adjoint(self, y: jnp.ndarray, xp: jnp.ndarray) -> jnp.ndarray:
+        """Adjoint: Tᵗ y"""
+        idx, w = self.stencil_fn(xp)
+        return jnp.sum(y[idx] * w, axis=1)
+
+    def stencil(self, xp: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        return self.stencil_fn(xp)
+
+
+
 class DwiOptimizer:
     def __init__(self, omega: jnp.ndarray, m_part: Tuple[int, int, int], m_cell: Tuple[int, int, int]):
         self.omega = omega
@@ -182,7 +202,7 @@ class DwiOptimizer:
         self.xp_base = self.xp_base.reshape(3, *target_res[-3:])
         self.xp_base = self.xp_base.reshape(*self.xp_base.shape[0:3], -1)
         self.lambda_smooth = 0.2
-        self.stencil_build_fn = make_stencil_builder(self.omega, self.m_cell, self.m_part)
+        self.interpolator = PICInterpolator(self.omega, self.m_cell, self.m_part)
 
         # self.stencil_build_fn = make_diff_stencil_builder(self.omega, self.m_cell, 1)
         self.part_lin = (
@@ -237,12 +257,13 @@ class DwiOptimizer:
                 # True data residual: ∑ₖ ‖Tₖ rho − yₖ‖²
                 def forward_error(k, err_sum):
                     xp = distortion_model.apply(xp_base, k, vol_index)
-                    idx, w = self.stencil_build_fn(xp)
+                    # idx, w = self.interpolatro(xp)
                     # y_pred = jnp.sum(rho_est[idx] * w, axis=1)
                     # # y_pred = push_fn(rho_est, xp)
                     # err = jnp.sum((y_pred - y[k]) ** 2)
 
-                    y_k_ref = pic_adjoint(y[k], idx, w)  # resample y_k into reference frame
+                    # y_k_ref = pic_adjoint(y[k], idx, w)  # resample y_k into reference frame
+                    y_k_ref = self.interpolator.adjoint(y[k], xp)
                     err = jnp.sum((rho_est - y_k_ref) ** 2)
 
                     return err_sum + err
@@ -285,11 +306,8 @@ class DwiOptimizer:
             # --- 1. particle coords for this observation ------------------------
             xp = distortion_model.apply(xp_base, k, vol_index)  # (3, Np)
 
-            # --- 2. build 27-point PIC stencil ----------------------------------
-            idx, w = self.stencil_build_fn(xp)
-
-            # --- 3. apply adjoint ----------------------------------------------
-            acc = acc + pic_adjoint(y[k], idx, w)
+            # --- 2. build 27-point PIC stencil ---------
+            acc = acc + self.interpolator.adjoint(y[k], xp)
             return acc
 
         rhs = lax.fori_loop(0, n_obs, body,
@@ -319,25 +337,8 @@ class DwiOptimizer:
             # 1) build PIC stencil for this observation
             xp = distortion_model.apply(xp_base, k, vol_index)  # (3,N)
 
-            # xp_vox = jnp.floor(xp).astype(int)
-            # z, y, x = xp_vox
-            # in_patch = (
-            #         (z >= 14) & (z < 20) &
-            #         (y >= 30) & (y < 35) &
-            #         (x >= 30) & (x < 35)
-            # )
-            # jax.debug.print("Particles in patch: {}", jnp.sum(in_patch))
-
-            idx, w = self.stencil_build_fn(xp)  # (N,S) each
-
-            # 2) forward ρ → y   (particles ➜ cells)
-            val_flat = (x_vec[:, None] * w).reshape(-1)  # (N*S,)
-            idx_flat = idx.reshape(-1)
-            y_cells = jnp.zeros(self.n_cells, x.dtype).at[idx_flat].add(val_flat)
-
-            # 3) adjoint  y → ρ  (cells ➜ particles)
-            contrib = y_cells[idx] * w  # (N,S)
-            yt = contrib.sum(axis=1)  # (N,)
+            y_cells = self.interpolator.forward(x_vec, xp)
+            yt = self.interpolator.adjoint(y_cells, xp)
 
             return yt.astype(x_vec.dtype)
 

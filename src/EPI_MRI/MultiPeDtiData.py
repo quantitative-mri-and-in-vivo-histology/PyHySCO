@@ -84,9 +84,9 @@ class MultiPeDtiData:
         pe_rpe_permute_back = []
         pe_rpe_permute = []
         n_slice_idx = list(range(11, 14))
-        n_slice_idx = None
-        #n_vol_idx = list(range(0, 8))
-        n_vol_idx = None
+        # n_slice_idx = None
+        n_vol_idx = list(range(0, 8))
+        # n_vol_idx = None
 
         # image_config['pe_pairs'] = [image_config['pe_pairs'][0]]
         # image_config['pe_pairs'] = image_config['pe_pairs'][0:2]
